@@ -253,6 +253,7 @@ name = "edit"
 version = "2.0.0"
 dependencies = [
  "criterion",
+ "foldhash",
  "libc",
  "lsh",
  "spellbook",

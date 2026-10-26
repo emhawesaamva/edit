@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use spellbook::Dictionary;
+use super::Dictionary;
 
 const AFF: &str = include_str!("../../../../assets/dictionaries/en_US/index.aff");
 const DIC: &str = include_str!("../../../../assets/dictionaries/en_US/index.dic");
@@ -55,7 +55,7 @@ pub fn start_loading() {
 }
 
 fn load() -> Option<Dictionary> {
-    Dictionary::new(AFF, DIC).ok()
+    Dictionary::new_with_hasher(AFF, DIC, Default::default()).ok()
 }
 
 /// Returns the dictionary if it has finished loading. Never blocks.
@@ -103,6 +103,20 @@ mod tests {
         assert!(!dict.check("teh"));
         assert_eq!(dictionary_status(), DictionaryStatus::Ready);
         assert!(dictionary().is_some());
+    }
+
+    // Regression: spellbook's default hasher gets a random seed for every dictionary, so the order
+    // of equally good suggestions changed between sessions, and between two dictionaries here.
+    #[test]
+    fn test_suggestion_order_is_stable() {
+        let (a, b) = (load().unwrap(), load().unwrap());
+        // With random seeds, two sessions rarely agreed on the suggestions for these words.
+        for word in ["yersa", "peaples", "bigginging", "ened", "errara", "strictist"] {
+            let (mut x, mut y) = (Vec::new(), Vec::new());
+            a.suggest(word, &mut x);
+            b.suggest(word, &mut y);
+            assert_eq!(x, y, "{word}");
+        }
     }
 
     #[test]

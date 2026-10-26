@@ -24,9 +24,16 @@ pub use dictionary::dictionary_blocking;
 pub use dictionary::{
     DictionaryStatus, dictionary, dictionary_status, poll_timeout, start_loading,
 };
-pub use spellbook::Dictionary;
 
 use crate::framebuffer::Attributes;
+
+/// spellbook's dictionary with a fixed hash seed instead of its default, random one.
+///
+/// The order of its word table depends on the seed, and that order breaks the ties between
+/// equally good suggestions. So with a random seed, the first suggestion for some words changed
+/// from one session to the next ("beggining": "beginning" or "begging"). The dictionary is built
+/// only from the bundled files, so a fixed seed doesn't expose it to hash flooding.
+pub type Dictionary = spellbook::Dictionary<foldhash::fast::FixedState>;
 
 /// Words longer than this (in bytes) are neither checked nor offered suggestions.
 pub const MAX_WORD_LEN: usize = 48;
