@@ -18,13 +18,19 @@ use crate::framebuffer::Framebuffer;
 use crate::helpers::*;
 use crate::lsh::Highlighter;
 use crate::simd;
-use crate::spellcheck::scope::Scope;
+use crate::spellcheck::scope::{MarkdownState, Scope};
 use crate::spellcheck::{self, DictionaryStatus, tokenizer};
 use crate::unicode::{self, Cursor};
 
 /// Lines longer than this (including the newline) aren't spell checked.
 /// The highlighter gives up at 32 KiB.
 const MAX_LINE_LEN: usize = 16 * KIBI;
+
+/// Logical lines between two [`MarkdownCheckpoints`].
+#[cfg(debug_assertions)]
+const MARKDOWN_INTERVAL: CoordType = 16;
+#[cfg(not(debug_assertions))]
+const MARKDOWN_INTERVAL: CoordType = 1024;
 
 /// Per-buffer spell checking state. Lives in `TextBuffer::spell`.
 #[derive(Default)]
@@ -33,9 +39,34 @@ pub(super) struct SpellState {
     enabled: bool,
     /// [`TextBuffer::generation`] as of the last render.
     seen_generation: u32,
+    /// The highest [`TextBuffer::generation`] seen by a render. New edits get a higher one,
+    /// while undo and redo restore older ones.
+    max_generation: u32,
     /// The cursor offset right after the last edit, for as long as the cursor stays there.
     /// A misspelled word that ends here is still being typed, so it isn't underlined yet.
     suppress_at: Option<usize>,
+    markdown: MarkdownCheckpoints,
+}
+
+/// Markdown's block state at the start of every [`MARKDOWN_INTERVAL`]th line,
+/// so that finding the state at the first visible line doesn't scan the whole file every frame.
+#[derive(Default)]
+struct MarkdownCheckpoints {
+    /// The [`TextBuffer::generation`] the checkpoints are valid for.
+    generation: u32,
+    /// The first line changed since then, see [`SpellState::invalidate_from`].
+    dirty_from: Option<CoordType>,
+    /// The offset of line `i * MARKDOWN_INTERVAL`, and the state at its start.
+    states: Vec<(usize, MarkdownState)>,
+}
+
+impl SpellState {
+    /// `TextBuffer` calls this wherever a change invalidates its highlighter cache:
+    /// Logical line `line` and everything after it may have changed.
+    pub(super) fn invalidate_from(&mut self, line: CoordType) {
+        let dirty = &mut self.markdown.dirty_from;
+        *dirty = Some(dirty.map_or(line, |d| d.min(line)));
+    }
 }
 
 /// The misspelled word at the cursor, see [`TextBuffer::spell_word_at_cursor`].
@@ -152,7 +183,14 @@ impl TextBuffer {
         let generation = self.generation();
         if self.spell.seen_generation != generation {
             self.spell.seen_generation = generation;
-            self.spell.suppress_at = Some(self.cursor.offset);
+            // Undo and redo aren't typing, so they don't hide the word at the cursor.
+            // (Undoing a replacement leaves the cursor at the end of the misspelled word.)
+            if generation > self.spell.max_generation {
+                self.spell.max_generation = generation;
+                self.spell.suppress_at = Some(self.cursor.offset);
+            } else {
+                self.spell.suppress_at = None;
+            }
         } else if self.spell.suppress_at != Some(self.cursor.offset) {
             self.spell.suppress_at = None;
         }
@@ -294,6 +332,12 @@ impl TextBuffer {
             return res;
         }
 
+        let mut md = if scope.needs_markdown_state() {
+            self.spell_markdown_state_at(arena, logical_y_range.start)
+        } else {
+            MarkdownState::default()
+        };
+
         let mut highlighter = match self.language {
             Some(language) if scope.needs_highlighter() => {
                 Some(Highlighter::new(&self.buffer, language))
@@ -301,9 +345,11 @@ impl TextBuffer {
             _ => None,
         };
 
-        // Whether a line starts fresh (outside of fenced code blocks, etc.) is `is_idle()`
-        // right before parsing it. For the first line, that requires parsing the one before it.
+        // `is_idle()` right before parsing a line tells whether it starts fresh (e.g. outside a diff).
+        // For the first line, that requires parsing the one before it. `parse_line()` seeks
+        // on its own otherwise, so the other scopes skip this (it can cost up to a checkpoint interval).
         if let Some(highlighter) = &mut highlighter
+            && scope.needs_idle_state()
             && logical_y_range.start > 0
         {
             let scratch = scratch_arena(Some(arena));
@@ -327,7 +373,8 @@ impl TextBuffer {
             }
 
             let scratch = scratch_arena(Some(arena));
-            let starts_idle = highlighter.as_ref().is_none_or(|h| h.is_idle());
+            let starts_idle =
+                !scope.needs_idle_state() || highlighter.as_ref().is_none_or(|h| h.is_idle());
             let highlights = match &mut highlighter {
                 Some(highlighter) => {
                     self.highlighter_cache.parse_line(&scratch, highlighter, logical_y)
@@ -335,18 +382,17 @@ impl TextBuffer {
                 None => BVec::empty(),
             };
 
-            let Some(line) = read_line(&self.buffer, &scratch, cursor.offset) else {
-                continue;
-            };
+            let (line, line_len) = read_line(&self.buffer, &scratch, cursor.offset);
             let line = unicode::strip_newline(line);
-            if scope.skip_line(line, starts_idle) {
+            // Lines that are too long to check still go through `skip_line()`, to keep `md` in sync.
+            if scope.skip_line(line, starts_idle, &mut md) || line_len > MAX_LINE_LEN {
                 continue;
             }
 
             let line_offset = cursor.offset;
-            scope.for_each_segment(line, line_offset, &highlights, |segment| {
+            scope.for_each_segment(line, line_offset, &highlights, |segment, kind| {
                 let text = &line[segment.clone()];
-                tokenizer::for_each_word(text, |range| {
+                tokenizer::for_each_word_in(text, kind, |range| {
                     // SAFETY: The tokenizer only yields ranges of valid UTF-8.
                     let word = unsafe { str::from_utf8_unchecked(&text[range.clone()]) };
                     if !spellcheck::is_word_correct(dict, word) {
@@ -358,6 +404,57 @@ impl TextBuffer {
         }
 
         res
+    }
+
+    /// Returns Markdown's block state at the start of logical line `y`.
+    ///
+    /// That depends on every line before it, so the states at every [`MARKDOWN_INTERVAL`]th line
+    /// are kept, up to the first line an edit changes. Scrolling and typing then scan fewer than
+    /// that many lines, unless an edit happened far above the first visible line.
+    fn spell_markdown_state_at(&mut self, arena: &Arena, y: CoordType) -> MarkdownState {
+        let cache = &mut self.spell.markdown;
+        let generation = self.buffer.generation();
+        // If the generation is the same, so is the text (e.g. after an edit and its undo).
+        let dirty_from = cache.dirty_from.take();
+        if cache.generation != generation {
+            cache.generation = generation;
+            // Like `HighlighterCache::invalidate_from()`. A change that didn't
+            // report its first line (there shouldn't be any) drops all checkpoints.
+            let keep = dirty_from
+                .and_then(|line| usize::try_from(line).ok())
+                .map_or(0, |line| line.div_ceil(MARKDOWN_INTERVAL as usize));
+            cache.states.truncate(keep);
+        }
+        if cache.states.is_empty() {
+            cache.states.push((0, MarkdownState::default()));
+        }
+
+        let n = usize::try_from(y / MARKDOWN_INTERVAL).unwrap_or(0).min(cache.states.len() - 1);
+        let (mut offset, mut state) = cache.states[n];
+        let mut line_y = n as CoordType * MARKDOWN_INTERVAL;
+        // Only a line that spans both halves of the gap buffer is copied into the arena,
+        // so one is enough for the whole scan.
+        let scratch = scratch_arena(Some(arena));
+
+        while line_y < y {
+            let (line, line_len) = read_line(&self.buffer, &scratch, offset);
+            if line_len == 0 {
+                // Past the end of the buffer.
+                break;
+            }
+
+            state.next_line(unicode::strip_newline(line));
+            offset += line_len;
+            line_y += 1;
+
+            if line_y % MARKDOWN_INTERVAL == 0
+                && cache.states.len() == (line_y / MARKDOWN_INTERVAL) as usize
+            {
+                cache.states.push((offset, state));
+            }
+        }
+
+        state
     }
 }
 
@@ -373,26 +470,24 @@ fn spell_at_not_ready(status: DictionaryStatus) -> SpellAt {
 }
 
 /// Reads the line starting at `offset`, including its newline, like `Highlighter::read_next_line()`.
+/// Returns the line and its length. If it's longer than [`MAX_LINE_LEN`], only that much of it is returned.
 /// The line is only copied into `arena` if it spans both halves of the gap buffer.
-/// Returns `None` if the line is longer than [`MAX_LINE_LEN`].
 fn read_line<'a>(
     doc: &'a dyn ReadableDocument,
     arena: &'a Arena,
     mut offset: usize,
-) -> Option<&'a [u8]> {
+) -> (&'a [u8], usize) {
     let chunk = doc.read_forward(offset);
     let (end, line) = simd::lines_fwd(chunk, 0, 0, 1);
-    if end > MAX_LINE_LEN {
-        return None;
-    }
+    let mut len = end;
 
     offset += end;
     if line == 1 || doc.read_forward(offset).is_empty() {
-        return Some(&chunk[..end]);
+        return (&chunk[..end.min(MAX_LINE_LEN)], len);
     }
 
     let mut buf = BVec::empty();
-    buf.extend_from_slice(arena, &chunk[..end]);
+    buf.extend_from_slice(arena, &chunk[..end.min(MAX_LINE_LEN)]);
 
     loop {
         let chunk = doc.read_forward(offset);
@@ -401,11 +496,9 @@ fn read_line<'a>(
         }
 
         let (end, line) = simd::lines_fwd(chunk, 0, 0, 1);
-        if buf.len() + end > MAX_LINE_LEN {
-            return None;
-        }
-
-        buf.extend_from_slice(arena, &chunk[..end]);
+        let room = MAX_LINE_LEN.saturating_sub(buf.len());
+        buf.extend_from_slice(arena, &chunk[..end.min(room)]);
+        len += end;
         offset += end;
 
         if line == 1 {
@@ -413,17 +506,19 @@ fn read_line<'a>(
         }
     }
 
-    Some(buf.leak())
+    (buf.leak(), len)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Seek, SeekFrom, Write};
     use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
     use super::*;
     use crate::buffer::CursorMovement;
     use crate::lsh::{LANGUAGES, Language};
     use crate::spellcheck::dictionary_blocking;
+    use crate::sys::memfd;
 
     /// The spell checking switches are process-wide, but tests run in parallel.
     /// Tests that need the defaults share this lock, tests that change them take it exclusively.
@@ -577,6 +672,226 @@ Back to coment prose.
         assert_eq!(collect_lines(&mut tb, 5..18), ["acheive", "freind", "coment"]);
     }
 
+    /// The misspelled words in the entire buffer, along with their logical line.
+    fn collect_with_lines(tb: &mut TextBuffer) -> Vec<(CoordType, String)> {
+        (0..tb.logical_line_count())
+            .flat_map(|y| collect_lines(tb, y..y + 1).into_iter().map(move |w| (y, w)))
+            .collect()
+    }
+
+    /// Asserts that collecting from any line to the end of the buffer finds `expected`'s words
+    /// from that line on. Goes top to bottom and then bottom to top, so that the Markdown
+    /// checkpoints get both created and reused.
+    fn assert_every_window(tb: &mut TextBuffer, expected: &[(CoordType, &str)]) {
+        let n = tb.logical_line_count();
+        for y0 in (0..=n).chain((0..=n).rev()) {
+            let words: Vec<_> =
+                expected.iter().filter(|(y, _)| *y >= y0).map(|(_, w)| *w).collect();
+            assert_eq!(collect_lines(tb, y0..n), words, "from line {y0}");
+        }
+    }
+
+    #[test]
+    fn test_collect_markdown_lost_fences() {
+        let _g = shared_globals();
+        // The highlighter loses track of the fences after the YAML block scalar (it ends at the
+        // closing fence) and the unmatched `'` in sh. The checked lines must not depend on it.
+        let doc = "\
+Intro with a speling mistake.
+```yaml
+jobs:
+  build:
+    steps:
+      - run: |
+          echo wrod
+```
+Prose after the fence with recieve in it.
+```sh
+$ tool --check
+You don't have a freind
+```
+Then fix teh setting.
+~~~
+tilde fence with untill
+~~~
+```rust
+let s = \"wierd\";
+```
+Trailing coment prose.
+";
+        let expected = [(0, "speling"), (8, "recieve"), (13, "teh"), (20, "coment")];
+        let mut tb = buffer(Some("markdown"), doc);
+        assert_eq!(collect_with_lines(&mut tb), expected.map(|(y, w)| (y, w.to_string())));
+        assert_every_window(&mut tb, &expected);
+        let mut tb = buffer(Some("markdown"), doc);
+        assert_every_window(&mut tb, &expected);
+
+        // Rendering a window that starts inside the sh fence, which opened above it.
+        let mut tb = buffer(Some("markdown"), doc);
+        assert_eq!(
+            render(&mut tb, Point { x: 0, y: 11 }, size(40, 10), false),
+            [run(2, 9, Curly, "teh"), run(9, 9, Curly, "coment")]
+        );
+    }
+
+    #[test]
+    fn test_collect_markdown_edits() {
+        let _g = shared_globals();
+        let mut doc = String::new();
+        for i in 0..40 {
+            if i % 10 == 5 {
+                doc.push_str("```\nwierd code\n```\n");
+            } else {
+                doc.push_str("Some teh prose.\n");
+            }
+        }
+        let mut tb = buffer(Some("markdown"), &doc);
+        let original = assert_like_fresh(&mut tb);
+        assert_eq!(original.len(), 36);
+        assert!(original.iter().all(|(_, w)| w == "teh"), "{original:?}");
+
+        // Opening a fence at the top inverts all of them.
+        tb.cursor_move_to_offset(0);
+        tb.write_canon(b"```\n");
+        let inverted = assert_like_fresh(&mut tb);
+        assert_eq!(inverted.len(), 4);
+        assert!(inverted.iter().all(|(_, w)| w == "wierd"), "{inverted:?}");
+
+        // Undo and redo restore older generations.
+        tb.undo();
+        assert_eq!(contents(&tb), doc);
+        assert_eq!(assert_like_fresh(&mut tb), original);
+        tb.redo();
+        assert_eq!(assert_like_fresh(&mut tb), inverted);
+        tb.undo();
+
+        // Deleting the third fence's opening line (29) with backspace inverts the ones after it.
+        tb.cursor_move_to_logical(Point { x: 0, y: 30 });
+        for _ in 0..4 {
+            tb.delete(CursorMovement::Grapheme, -1);
+            assert_like_fresh(&mut tb);
+        }
+        assert_ne!(assert_like_fresh(&mut tb), original);
+        // Typing at the end, and undoing all of it.
+        tb.cursor_move_to_offset(tb.text_length());
+        tb.write_canon(b"teh");
+        assert_like_fresh(&mut tb);
+        while contents(&tb) != doc {
+            tb.undo();
+            assert_like_fresh(&mut tb);
+        }
+        assert_eq!(assert_like_fresh(&mut tb), original);
+
+        // Loading a file, and then editing below its first change before the next render.
+        let mut file = memfd().unwrap();
+        file.write_all(format!("```\n{doc}").as_bytes()).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        tb.read_file(&mut file, Some("UTF-8")).unwrap();
+        tb.cursor_move_to_logical(Point { x: 0, y: 45 });
+        tb.write_canon(b"x");
+        assert_eq!(assert_like_fresh(&mut tb), inverted);
+    }
+
+    /// Asserts that `tb` finds the same misspelled words from every line on as a fresh buffer
+    /// with the same text (which has no Markdown checkpoints yet), and returns them.
+    fn assert_like_fresh(tb: &mut TextBuffer) -> Vec<(CoordType, String)> {
+        let mut fresh = buffer(Some("markdown"), &contents(tb));
+        let expected = collect_with_lines(&mut fresh);
+        let words: Vec<_> = expected.iter().map(|(y, w)| (*y, w.as_str())).collect();
+        assert_every_window(tb, &words);
+        expected
+    }
+
+    #[test]
+    fn test_markdown_checkpoints() {
+        let _g = shared_globals();
+        let interval = MARKDOWN_INTERVAL;
+        let mut tb = buffer(Some("markdown"), &"Prose.\n".repeat(6 * interval as usize + 4));
+        let scratch = scratch_arena(None);
+        let state_at = |tb: &mut TextBuffer, y| _ = tb.spell_markdown_state_at(&scratch, y);
+        let checkpoints = |tb: &TextBuffer| tb.spell.markdown.states.clone();
+
+        state_at(&mut tb, 6 * interval);
+        assert_eq!(checkpoints(&tb).len(), 7);
+        // Scrolling up reuses them.
+        state_at(&mut tb, 2 * interval + 1);
+        assert_eq!(checkpoints(&tb).len(), 7);
+        // Mark the checkpoint at the start of line `interval`, to tell whether it gets recomputed.
+        tb.spell.markdown.states[1].0 = usize::MAX;
+
+        // Edits keep the checkpoints at their first changed line and above, like the highlighter's.
+        tb.cursor_move_to_logical(Point { x: 3, y: 2 * interval + 8 });
+        tb.write_canon(b"x");
+        state_at(&mut tb, 2 * interval + 1);
+        assert_eq!(checkpoints(&tb).len(), 3);
+        assert_eq!(checkpoints(&tb)[1].0, usize::MAX);
+        state_at(&mut tb, 6 * interval);
+        assert_eq!(checkpoints(&tb).len(), 7);
+        // So do undo and redo.
+        tb.undo();
+        tb.redo();
+        tb.undo();
+        state_at(&mut tb, 2 * interval + 1);
+        assert_eq!(checkpoints(&tb).len(), 3);
+        assert_eq!(checkpoints(&tb)[1].0, usize::MAX);
+
+        // An edit and its undo before the next lookup don't change anything.
+        state_at(&mut tb, 6 * interval);
+        let before = checkpoints(&tb);
+        tb.cursor_move_to_logical(Point { x: 0, y: 0 });
+        tb.write_canon(b"x");
+        tb.undo();
+        state_at(&mut tb, 2 * interval + 1);
+        assert_eq!(checkpoints(&tb), before);
+
+        // A change that didn't report its first line drops all of them.
+        tb.cursor_move_to_logical(Point { x: 0, y: 5 * interval });
+        tb.write_canon(b"x");
+        tb.spell.markdown.dirty_from = None;
+        state_at(&mut tb, 2 * interval + 1);
+        assert_eq!(checkpoints(&tb).len(), 3);
+        assert_eq!(checkpoints(&tb)[1].0, interval as usize * "Prose.\n".len());
+    }
+
+    #[test]
+    fn test_collect_markdown_long_lines() {
+        let _g = shared_globals();
+        // Lines too long to check still open fences and continue paragraphs.
+        let info = "x".repeat(MAX_LINE_LEN);
+        let long = "word ".repeat(MAX_LINE_LEN / 5 + 1);
+        let doc =
+            format!("```{info}\nwrod inside\n```\nteh after\n\n{long}\n    speling continues\n");
+        let expected = [(3, "teh"), (6, "speling")];
+        let mut tb = buffer(Some("markdown"), &doc);
+        assert_every_window(&mut tb, &expected);
+
+        // The same with the gap buffer's gap inside each of the long lines.
+        for offset in [10, doc.find("word").unwrap() + 10] {
+            let mut tb = buffer(Some("markdown"), &doc);
+            tb.cursor_move_to_offset(offset);
+            tb.write_canon(b"x");
+            assert_every_window(&mut tb, &expected);
+        }
+    }
+
+    #[test]
+    fn test_collect_markdown_continuation_lines() {
+        let _g = shared_globals();
+        let doc = "\
+- Top item
+    - Nested item with a long sentence that
+      wraps onto the next line with teh typo.
+
+A paragraph that is hard wrapped
+    and indented by four with wrod.
+
+    indented code with untill
+";
+        let mut tb = buffer(Some("markdown"), doc);
+        assert_eq!(collect(&mut tb), ["teh", "wrod"]);
+        assert_every_window(&mut tb, &[(2, "teh"), (5, "wrod")]);
+    }
+
     #[test]
     fn test_collect_git_commit() {
         let _g = shared_globals();
@@ -593,11 +908,14 @@ index 1234567..89abcde 100644
 @@ -1 +1 @@
 -old wrod of text
 +new speling of text
+ context with wierd text
 ";
         let mut tb = buffer(Some("git-commit"), doc);
         assert_eq!(collect(&mut tb), ["teh", "mispeled"]);
         // Starting inside the diff.
         assert_eq!(collect_lines(&mut tb, 10..12), [] as [&str; 0]);
+        // Starting at any line. A window that starts on the context line needs to know it's in the diff.
+        assert_every_window(&mut tb, &[(0, "teh"), (2, "mispeled")]);
     }
 
     #[test]
@@ -965,6 +1283,50 @@ fn mispeled_fn(speling: u32) {
         // Editing a finished word makes it the word being typed again.
         tb.delete(CursorMovement::Grapheme, -1);
         assert_eq!(render(&mut tb, true), all[..2]);
+    }
+
+    #[test]
+    fn test_finished_word_rule_undo_redo() {
+        let _g = shared_globals();
+        let screen = size(30, 1);
+        let render = |tb: &mut TextBuffer| render(tb, Point::default(), screen, true);
+        let wrod = [run(0, 6, Curly, "wrod")];
+
+        // Undoing a replacement leaves the cursor at the end of the misspelled word.
+        let mut tb = buffer(None, "hello wrod world");
+        tb.cursor_move_to_offset(0);
+        assert_eq!(render(&mut tb), wrod);
+        assert!(replace_at(&mut tb, 8, "word"));
+        assert_eq!(render(&mut tb), []);
+        tb.undo();
+        assert_eq!(contents(&tb), "hello wrod world");
+        assert_eq!(tb.cursor_offset(), 10);
+        assert_eq!(render(&mut tb), wrod);
+        assert_eq!(render(&mut tb), wrod);
+        tb.redo();
+        assert_eq!(render(&mut tb), []);
+        tb.undo();
+        assert_eq!(render(&mut tb), wrod);
+
+        // Undoing and redoing typing.
+        let mut tb = buffer(None, "hello wrod");
+        tb.undo_barrier();
+        assert_eq!(render(&mut tb), []);
+        tb.write_canon(b" now");
+        assert_eq!(render(&mut tb), wrod);
+        tb.undo();
+        assert_eq!(contents(&tb), "hello wrod");
+        assert_eq!(tb.cursor_offset(), 10);
+        assert_eq!(render(&mut tb), wrod);
+        tb.redo();
+        assert_eq!(render(&mut tb), wrod);
+
+        // Typing after an undo is typing again.
+        tb.undo();
+        assert_eq!(render(&mut tb), wrod);
+        tb.write_canon(b"d");
+        assert_eq!(contents(&tb), "hello wrodd");
+        assert_eq!(render(&mut tb), []);
     }
 
     fn word(tb: &TextBuffer, range: Range<usize>, visual_pos: Point) -> SpellAt {

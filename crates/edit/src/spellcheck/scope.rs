@@ -6,17 +6,26 @@
 //! CONTRACT (other modules rely on this):
 //! * [`Scope::for_language`] maps the buffer's language to a scope.
 //! * If [`Scope::needs_highlighter`] is false, the caller passes an empty `highlights` slice.
-//! * [`Scope::skip_line`] is called first; `starts_idle` is `Highlighter::is_idle()` sampled
-//!   right before parsing this line (always `true` if no highlighter is needed).
+//! * [`Scope::skip_line`] is called first, for every line in order, including lines that end up
+//!   not being checked (e.g. because they're too long). It gets the line without its trailing
+//!   newline (for a line that's too long to check, a prefix of it is enough), and:
+//!   * `starts_idle`: If [`Scope::needs_idle_state`], `Highlighter::is_idle()` sampled right before
+//!     parsing this line. For the first line, that requires parsing the one before it.
+//!     Otherwise always `true`.
+//!   * `md`: If [`Scope::needs_markdown_state`], Markdown's block state at the start of this line,
+//!     which `skip_line` advances past it. For the first line, the caller gets it by feeding every
+//!     line before it to [`MarkdownState::next_line`] (and may cache that). Otherwise ignored.
 //! * [`Scope::for_each_segment`] gets the line without its trailing newline, the line's absolute
 //!   buffer offset, and the line's highlight spans (absolute offsets, sentinel at the end, possibly
-//!   empty). It calls `f` with ranges relative to `line`, ascending and non-overlapping.
+//!   empty). It calls `f` with ranges relative to `line`, ascending and non-overlapping,
+//!   along with the [`TextKind`] the tokenizer should read the range as.
 
 use std::mem;
 use std::ops::Range;
 
 use lsh::runtime::Highlight;
 
+use super::tokenizer::TextKind;
 use crate::lsh::{HighlightKind, Language};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -61,6 +70,19 @@ impl Scope {
         !matches!(self, Self::Off | Self::Prose)
     }
 
+    /// Whether [`Scope::skip_line`] reads `starts_idle`.
+    pub fn needs_idle_state(self) -> bool {
+        // A `diff --git` line (`git commit -v`) keeps the highlighter busy until the end of the file.
+        // Markdown doesn't use this: Its highlighter hands fenced code blocks to the fence's language,
+        // which doesn't always hand control back at the closing fence (e.g. an unclosed `'` in sh).
+        matches!(self, Self::GitCommit)
+    }
+
+    /// Whether [`Scope::skip_line`] reads `md`.
+    pub fn needs_markdown_state(self) -> bool {
+        matches!(self, Self::Markdown)
+    }
+
     /// Whether text with the given highlight kind gets checked.
     pub fn is_checkable(self, kind: HighlightKind) -> bool {
         // NOTE: Always use `matches!` here and never an exhaustive match over `HighlightKind`.
@@ -89,13 +111,10 @@ impl Scope {
     }
 
     /// Whether the entire line should be skipped.
-    pub fn skip_line(self, line: &[u8], starts_idle: bool) -> bool {
+    pub fn skip_line(self, line: &[u8], starts_idle: bool, md: &mut MarkdownState) -> bool {
         match self {
             Self::Off => true,
-            // Inside a fenced code block (of any language), the highlighter isn't idle.
-            // That covers the closing fence as well, but not the opening one.
-            Self::Markdown => !starts_idle || is_markdown_code_line(line),
-            // A `diff --git` line (`git commit -v`) keeps the highlighter busy until the end of the file.
+            Self::Markdown => md.next_line(line),
             Self::GitCommit => !starts_idle,
             Self::Prose | Self::Code | Self::CommentsOnly => false,
         }
@@ -107,13 +126,13 @@ impl Scope {
         line: &[u8],
         line_offset: usize,
         highlights: &[Highlight<HighlightKind>],
-        mut f: impl FnMut(Range<usize>),
+        mut f: impl FnMut(Range<usize>, TextKind),
     ) {
         match self {
             Self::Off => return,
             Self::Prose => {
                 if !line.is_empty() {
-                    f(0..line.len());
+                    f(0..line.len(), TextKind::Prose);
                 }
                 return;
             }
@@ -121,12 +140,24 @@ impl Scope {
         }
 
         let to_line = |off: usize| off.saturating_sub(line_offset).min(line.len());
+        // Only code has string literals. Markdown's strings are link text and inline code, which are prose.
+        // A string that runs into a comment (`"a"// b`) is one segment, and comments are prose, too.
+        let kind = |string: bool, comment: bool| {
+            if self == Self::Code && string && !comment {
+                TextKind::CodeString
+            } else {
+                TextKind::Prose
+            }
+        };
         // How far we got. Clamping each span's start to it keeps the output ascending,
         // even if the spans aren't (they always are, but this costs nothing).
         let mut pos = 0;
         // Adjacent checkable spans are merged, so that words that cross
         // span boundaries (e.g. `**bold**ness`) don't get split in two.
         let mut seg = 0..0;
+        // Whether `seg` contains a string or comment span.
+        let mut string = false;
+        let mut comment = false;
 
         for (i, h) in highlights.iter().enumerate() {
             // A span extends to the start of the next one. The last one (normally the sentinel) extends to EOL.
@@ -139,32 +170,139 @@ impl Scope {
 
             if !self.is_checkable(h.kind) {
                 if !seg.is_empty() {
-                    f(mem::take(&mut seg));
+                    f(mem::take(&mut seg), kind(string, comment));
                 }
-            } else if seg.is_empty() {
+                continue;
+            }
+
+            if seg.is_empty() {
                 seg = beg..end;
+                string = false;
+                comment = false;
             } else {
                 seg.end = end;
             }
+            string |= h.kind == HighlightKind::String;
+            comment |= h.kind == HighlightKind::Comment;
         }
 
         if !seg.is_empty() {
-            f(seg);
+            f(seg, kind(string, comment));
         }
     }
 }
 
-/// Whether a Markdown line that starts outside a fenced code block is code:
-/// an opening code fence, or an indented code block.
-fn is_markdown_code_line(line: &[u8]) -> bool {
-    let trimmed = line.trim_ascii_start();
-    if trimmed.starts_with(b"```") || trimmed.starts_with(b"~~~") {
-        return true;
-    }
+/// Markdown's block structure at the start of a line, as far as spell checking cares:
+/// whether the line is inside a fenced code block, and whether an indented line would be code.
+///
+/// It follows CommonMark, minus containers: Fences and indented code blocks are recognized
+/// at the start of a line only (not after `>`), and list items don't shift the indentation.
+/// Also, anything that isn't blank or code counts as paragraph text (headings, too).
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct MarkdownState {
+    /// The fenced code block we're in, if any.
+    fence: Option<Fence>,
+    /// What an indented line would continue.
+    block: Block,
+}
 
-    // Nested list items are indented, too, but they aren't code.
-    let indented = line.starts_with(b"\t") || line.starts_with(b"    ");
-    indented && !is_markdown_list_item(trimmed)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Fence {
+    /// `` ` `` or `~`.
+    ch: u8,
+    /// The length of the opening fence. The closing one must be at least as long.
+    len: usize,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+enum Block {
+    /// The start of the file, or after a closing fence or a blank line that ended a paragraph.
+    /// An indented line starts indented code here.
+    #[default]
+    Fresh,
+    /// Paragraph text, which includes list items, headings, etc.
+    /// Indented code can't interrupt a paragraph, so an indented line continues it.
+    Paragraph,
+    /// Indented code. Blank lines don't end it, only a line that isn't indented does.
+    IndentedCode,
+}
+
+impl MarkdownState {
+    /// Advances the state past `line` (without its trailing newline).
+    /// Returns whether the line is code: a fence, inside a fenced code block, or indented code.
+    pub fn next_line(&mut self, line: &[u8]) -> bool {
+        let (indent, rest) = split_indent(line);
+
+        if let Some(fence) = self.fence {
+            // A closing fence has up to 3 spaces of indentation, at least as many
+            // of the same character as the opening one, and nothing but whitespace after them.
+            if indent < 4
+                && let Some((ch, len)) = fence_run(rest)
+                && ch == fence.ch
+                && len >= fence.len
+                && rest[len..].iter().all(|&b| b == b' ' || b == b'\t')
+            {
+                self.fence = None;
+                self.block = Block::Fresh;
+            }
+            return true;
+        }
+
+        if rest.is_empty() {
+            if self.block == Block::Paragraph {
+                self.block = Block::Fresh;
+            }
+            return false;
+        }
+
+        if indent >= 4 {
+            let code = match self.block {
+                // Nested list items (after a blank line) are indented, too, but they aren't code.
+                Block::Fresh => !is_markdown_list_item(rest),
+                Block::Paragraph => false,
+                Block::IndentedCode => true,
+            };
+            self.block = if code { Block::IndentedCode } else { Block::Paragraph };
+            return code;
+        }
+
+        if let Some((ch, len)) = fence_run(rest)
+            // The info string of a backtick fence can't contain backticks. Otherwise it's inline code.
+            && (ch == b'~' || !rest[len..].contains(&b'`'))
+        {
+            self.fence = Some(Fence { ch, len });
+            return true;
+        }
+
+        self.block = Block::Paragraph;
+        false
+    }
+}
+
+/// Splits `line` into the width of its indentation (tabs advance to the next multiple of 4)
+/// and the rest.
+fn split_indent(line: &[u8]) -> (usize, &[u8]) {
+    let mut width = 0;
+    let mut i = 0;
+    while let Some(&b) = line.get(i) {
+        match b {
+            b' ' => width += 1,
+            b'\t' => width += 4 - width % 4,
+            _ => break,
+        }
+        i += 1;
+    }
+    (width, &line[i..])
+}
+
+/// If `text` starts with a code fence (3 or more `` ` `` or `~`), returns its character and length.
+fn fence_run(text: &[u8]) -> Option<(u8, usize)> {
+    let ch = *text.first()?;
+    if ch != b'`' && ch != b'~' {
+        return None;
+    }
+    let len = text.iter().take_while(|&&b| b == ch).count();
+    (len >= 3).then_some((ch, len))
 }
 
 /// Whether `line` (with leading whitespace already trimmed) starts with a list marker
@@ -196,44 +334,61 @@ mod tests {
         Highlight { start, kind }
     }
 
+    fn segments_with_kinds(
+        scope: Scope,
+        line: &str,
+        line_offset: usize,
+        highlights: &[Highlight<HighlightKind>],
+    ) -> Vec<(Range<usize>, TextKind)> {
+        let mut res = Vec::new();
+        scope.for_each_segment(line.as_bytes(), line_offset, highlights, |r, k| res.push((r, k)));
+        res
+    }
+
     fn segments(
         scope: Scope,
         line: &str,
         line_offset: usize,
         highlights: &[Highlight<HighlightKind>],
     ) -> Vec<Range<usize>> {
-        let mut res = Vec::new();
-        scope.for_each_segment(line.as_bytes(), line_offset, highlights, |r| res.push(r));
-        res
+        segments_with_kinds(scope, line, line_offset, highlights)
+            .into_iter()
+            .map(|(r, _)| r)
+            .collect()
     }
 
     /// Spell checks `doc` the way `TextBuffer` does, with the real highlighter.
-    /// Returns one entry per line: `None` if the line is skipped, otherwise the checked text.
-    fn check_doc(language: Option<&'static Language>, doc: &str) -> Vec<Option<Vec<String>>> {
+    /// Returns one entry per line: `None` if the line is skipped, otherwise the checked text and its kind.
+    fn check_doc_with_kinds(
+        language: Option<&'static Language>,
+        doc: &str,
+    ) -> Vec<Option<Vec<(String, TextKind)>>> {
         let scope = Scope::for_language(language);
         let bytes = doc.as_bytes();
         let mut highlighter = match language {
             Some(language) if scope.needs_highlighter() => Some(Highlighter::new(&bytes, language)),
             _ => None,
         };
+        let mut md = MarkdownState::default();
         let mut res = Vec::new();
         let mut line_offset = 0;
 
         for raw in doc.split_inclusive('\n') {
             let line = raw.strip_suffix('\n').unwrap_or(raw);
             let scratch = scratch_arena(None);
-            let starts_idle = highlighter.as_ref().is_none_or(|h| h.is_idle());
+            let starts_idle =
+                !scope.needs_idle_state() || highlighter.as_ref().is_none_or(|h| h.is_idle());
             let highlights = match &mut highlighter {
                 Some(h) => h.parse_next_line(&scratch),
                 None => BVec::empty(),
             };
 
-            if scope.skip_line(line.as_bytes(), starts_idle) {
+            if scope.skip_line(line.as_bytes(), starts_idle, &mut md) {
                 res.push(None);
             } else {
                 let mut checked = Vec::new();
-                scope.for_each_segment(line.as_bytes(), line_offset, &highlights, |r| {
-                    checked.push(line[r].to_string());
+                scope.for_each_segment(line.as_bytes(), line_offset, &highlights, |r, k| {
+                    checked.push((line[r].to_string(), k));
                 });
                 res.push(Some(checked));
             }
@@ -242,6 +397,22 @@ mod tests {
         }
 
         res
+    }
+
+    /// Like [`check_doc_with_kinds`], without the kinds.
+    fn check_doc(language: Option<&'static Language>, doc: &str) -> Vec<Option<Vec<String>>> {
+        check_doc_with_kinds(language, doc)
+            .into_iter()
+            .map(|line| line.map(|segs| segs.into_iter().map(|(s, _)| s).collect()))
+            .collect()
+    }
+
+    /// Feeds `doc` to a fresh [`MarkdownState`] and returns the non-blank lines that aren't code.
+    fn markdown_prose(doc: &str) -> Vec<&str> {
+        let mut md = MarkdownState::default();
+        doc.lines()
+            .filter(|line| !md.next_line(line.as_bytes()) && !line.trim().is_empty())
+            .collect()
     }
 
     /// Like [`check_doc`], but returns the lines' text (or `None` if skipped)
@@ -332,6 +503,18 @@ mod tests {
     }
 
     #[test]
+    fn test_needs_state() {
+        use Scope::*;
+
+        for scope in [Off, Prose, Markdown, GitCommit, Code, CommentsOnly] {
+            assert_eq!(scope.needs_idle_state(), scope == GitCommit, "{scope:?}");
+            assert_eq!(scope.needs_markdown_state(), scope == Markdown, "{scope:?}");
+            // Both states are only meaningful along with highlights.
+            assert!(!scope.needs_idle_state() || scope.needs_highlighter(), "{scope:?}");
+        }
+    }
+
+    #[test]
     fn test_is_checkable() {
         use HighlightKind::*;
 
@@ -378,6 +561,13 @@ mod tests {
 
         assert_eq!(segments(Scope::Off, "hello world", 0, &[]), []);
         assert_eq!(segments(Scope::Off, "hello world", 0, &hl), []);
+
+        // Plain text is prose, even where a highlighter would see a string.
+        let hl = [span(0, HighlightKind::String), span(11, HighlightKind::Other)];
+        assert_eq!(
+            segments_with_kinds(Scope::Prose, "hello world", 0, &hl),
+            [(0..11, TextKind::Prose)]
+        );
     }
 
     #[test]
@@ -443,6 +633,74 @@ mod tests {
 
     #[test]
     #[allow(clippy::single_range_in_vec_init)]
+    fn test_segments_kinds() {
+        use HighlightKind::*;
+        use TextKind::{CodeString, Prose};
+
+        // `let s = "some text"; // a comment`
+        let line = r#"let s = "some text"; // a comment"#;
+        let hl = [
+            span(0, KeywordOther),
+            span(3, Other),
+            span(8, String),
+            span(19, Other),
+            span(21, Comment),
+            span(line.len(), Other),
+        ];
+        assert_eq!(
+            segments_with_kinds(Scope::Code, line, 0, &hl),
+            [(8..19, CodeString), (21..33, Prose)]
+        );
+        assert_eq!(segments_with_kinds(Scope::CommentsOnly, line, 0, &hl), [(21..33, Prose)]);
+
+        // A string merged with a comment is read as a comment, in either order.
+        let hl = [span(0, String), span(4, Comment), span(9, Other)];
+        assert_eq!(segments_with_kinds(Scope::Code, "\"ab\"// cd", 0, &hl), [(0..9, Prose)]);
+        let hl = [span(0, Comment), span(5, String), span(9, Other)];
+        assert_eq!(segments_with_kinds(Scope::Code, "/* */\"ab\"", 0, &hl), [(0..9, Prose)]);
+
+        // Each segment gets its own kind.
+        // `"ab" + /* c */ + "d"`
+        let line = r#""ab" + /* c */ + "d""#;
+        let hl = [
+            span(0, String),
+            span(4, Other),
+            span(7, Comment),
+            span(14, Other),
+            span(17, String),
+            span(line.len(), Other),
+        ];
+        assert_eq!(
+            segments_with_kinds(Scope::Code, line, 0, &hl),
+            [(0..4, CodeString), (7..14, Prose), (17..20, CodeString)]
+        );
+
+        // Empty spans don't change the kind.
+        let hl = [span(0, String), span(2, Comment), span(2, String), span(4, Other)];
+        assert_eq!(segments_with_kinds(Scope::Code, "\"ab\"", 0, &hl), [(0..4, CodeString)]);
+
+        // Markdown's strings are link text and inline code. Commit messages have none.
+        let line = "see [the docs](url) now";
+        let hl = [
+            span(0, Other),
+            span(5, String),
+            span(13, Other),
+            span(15, MarkupLink),
+            span(18, Other),
+            span(line.len(), Other),
+        ];
+        assert_eq!(
+            segments_with_kinds(Scope::Markdown, line, 0, &hl),
+            [(0..15, Prose), (18..23, Prose)]
+        );
+        assert_eq!(
+            segments_with_kinds(Scope::GitCommit, line, 0, &hl),
+            [(0..5, Prose), (13..15, Prose), (18..23, Prose)]
+        );
+    }
+
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)]
     fn test_segments_clamping() {
         use HighlightKind::*;
 
@@ -477,46 +735,55 @@ mod tests {
 
     #[test]
     fn test_skip_line_markdown() {
-        let md = Scope::Markdown;
-
-        // Inside a fenced code block, including the closing fence.
-        assert!(md.skip_line(b"plain prose", false));
-        assert!(md.skip_line(b"```", false));
+        // Whether `line` is skipped at the start of the file (or after a blank line).
+        let skip = |line: &[u8]| {
+            let mut md = MarkdownState::default();
+            // The highlighter's state doesn't matter.
+            let res = Scope::Markdown.skip_line(line, false, &mut md);
+            assert_eq!(res, Scope::Markdown.skip_line(line, true, &mut MarkdownState::default()));
+            res
+        };
 
         // Opening fences.
-        assert!(md.skip_line(b"```", true));
-        assert!(md.skip_line(b"```python", true));
-        assert!(md.skip_line(b"  ```rust", true));
-        assert!(md.skip_line(b"~~~", true));
-        assert!(md.skip_line(b"~~~ text", true));
+        assert!(skip(b"```"));
+        assert!(skip(b"```python"));
+        assert!(skip(b"   ```rust"));
+        assert!(skip(b"````"));
+        assert!(skip(b"~~~"));
+        assert!(skip(b"~~~ text"));
+        assert!(skip(b"~~~ tilde info can have ` backticks"));
 
         // Indented code.
-        assert!(md.skip_line(b"    let x = 1;", true));
-        assert!(md.skip_line(b"\tlet x = 1;", true));
-        assert!(md.skip_line(b"        deeper", true));
-        assert!(md.skip_line(b"    -not a list item", true));
-        assert!(md.skip_line(b"    1.5 is a number", true));
-        assert!(md.skip_line(b"    a. lettered", true));
-        assert!(md.skip_line(b"    ", true));
+        assert!(skip(b"    let x = 1;"));
+        assert!(skip(b"\tlet x = 1;"));
+        assert!(skip(b"  \tlet x = 1;"));
+        assert!(skip(b"        deeper"));
+        assert!(skip(b"    -not a list item"));
+        assert!(skip(b"    1.5 is a number"));
+        assert!(skip(b"    a. lettered"));
+        assert!(skip(b"    ```"));
 
         // Indented list items.
-        assert!(!md.skip_line(b"    - nested", true));
-        assert!(!md.skip_line(b"    * nested", true));
-        assert!(!md.skip_line(b"    + nested", true));
-        assert!(!md.skip_line(b"\t- nested", true));
-        assert!(!md.skip_line(b"    1. nested", true));
-        assert!(!md.skip_line(b"    12) nested", true));
-        assert!(!md.skip_line(b"\t\t-\tnested", true));
+        assert!(!skip(b"    - nested"));
+        assert!(!skip(b"    * nested"));
+        assert!(!skip(b"    + nested"));
+        assert!(!skip(b"\t- nested"));
+        assert!(!skip(b"    1. nested"));
+        assert!(!skip(b"    12) nested"));
+        assert!(!skip(b"\t\t-\tnested"));
 
         // Everything else.
-        assert!(!md.skip_line(b"", true));
-        assert!(!md.skip_line(b"plain prose", true));
-        assert!(!md.skip_line(b"   three spaces", true));
-        assert!(!md.skip_line(b"# Heading", true));
-        assert!(!md.skip_line(b"> quote", true));
-        assert!(!md.skip_line(b"- item", true));
-        assert!(!md.skip_line(b"`code` and ``more``", true));
-        assert!(!md.skip_line(b"~~strike~~", true));
+        assert!(!skip(b""));
+        assert!(!skip(b"    "));
+        assert!(!skip(b"plain prose"));
+        assert!(!skip(b"   three spaces"));
+        assert!(!skip(b"# Heading"));
+        assert!(!skip(b"> quote"));
+        assert!(!skip(b"- item"));
+        assert!(!skip(b"`code` and ``more``"));
+        assert!(!skip(b"``two backticks``"));
+        assert!(!skip(b"```inline``` code"));
+        assert!(!skip(b"~~strike~~"));
     }
 
     #[test]
@@ -525,15 +792,111 @@ mod tests {
             [b"", b"text", b"```", b"    indented", b"# comment", b"diff --git"];
 
         for line in lines {
+            let mut md = MarkdownState::default();
             for idle in [true, false] {
-                assert!(Scope::Off.skip_line(line, idle));
-                assert!(!Scope::Prose.skip_line(line, idle));
-                assert!(!Scope::Code.skip_line(line, idle));
-                assert!(!Scope::CommentsOnly.skip_line(line, idle));
+                assert!(Scope::Off.skip_line(line, idle, &mut md));
+                assert!(!Scope::Prose.skip_line(line, idle, &mut md));
+                assert!(!Scope::Code.skip_line(line, idle, &mut md));
+                assert!(!Scope::CommentsOnly.skip_line(line, idle, &mut md));
             }
-            assert!(!Scope::GitCommit.skip_line(line, true));
-            assert!(Scope::GitCommit.skip_line(line, false));
+            assert!(!Scope::GitCommit.skip_line(line, true, &mut md));
+            assert!(Scope::GitCommit.skip_line(line, false, &mut md));
+            // Only Markdown uses the state.
+            assert_eq!(md, MarkdownState::default());
         }
+    }
+
+    #[test]
+    fn test_markdown_fences() {
+        // Backticks and tildes, each closed only by its own kind.
+        let doc = "\
+Before.
+```
+inside backticks
+~~~
+still inside backticks
+```
+Between.
+~~~ text
+inside tildes
+```
+still inside tildes
+~~~
+After.
+";
+        assert_eq!(markdown_prose(doc), ["Before.", "Between.", "After."]);
+
+        // The closing fence must be at least as long as the opening one.
+        let doc =
+            "````md\n```\nstill inside\n````\nAfter.\n~~~~~\n~~~~\nstill inside\n~~~~~~\nEnd.\n";
+        assert_eq!(markdown_prose(doc), ["After.", "End."]);
+
+        // Up to 3 spaces of indentation on either fence. More is content (or indented code).
+        let doc = "   ```\n    ```\nstill inside\n   ```\nAfter.\n";
+        assert_eq!(markdown_prose(doc), ["After."]);
+        let doc = "```\n\t```\nstill inside\n  \t```\n```\nAfter.\n";
+        assert_eq!(markdown_prose(doc), ["After."]);
+
+        // Nothing but whitespace after the closing fence.
+        let doc = "```\n``` sh\nstill inside\n```  \t\nAfter.\n";
+        assert_eq!(markdown_prose(doc), ["After."]);
+        let doc = "~~~\n~~~ x\nstill inside\n~~~ \nAfter.\n";
+        assert_eq!(markdown_prose(doc), ["After."]);
+
+        // A backtick fence's info string can't contain backticks. That's inline code instead.
+        let doc = "```not `a` fence\nProse.\n~~~ a `tilde` fence\ninside\n~~~\nAfter.\n";
+        assert_eq!(markdown_prose(doc), ["```not `a` fence", "Prose.", "After."]);
+
+        // Fewer than 3 characters aren't a fence.
+        let doc = "``\nProse.\n~~\nMore.\n";
+        assert_eq!(markdown_prose(doc), ["``", "Prose.", "~~", "More."]);
+
+        // An unclosed fence runs to the end of the file.
+        let doc = "Prose.\n```\nfn main() {}\n\nMore code.\n";
+        assert_eq!(markdown_prose(doc), ["Prose."]);
+    }
+
+    #[test]
+    fn test_markdown_indented_code() {
+        // Indented code at the start of the file and after a blank line, but not after a paragraph.
+        let doc = "    code at the start
+Paragraph text
+    continues the paragraph
+\tthis, too
+
+    code after a blank line
+\tmore code
+
+    code after a blank line inside the code
+    - not a list item inside code
+Paragraph.
+";
+        assert_eq!(
+            markdown_prose(doc),
+            ["Paragraph text", "    continues the paragraph", "\tthis, too", "Paragraph.",]
+        );
+
+        // A closing fence ends the paragraph, too.
+        let doc = "```\ncode\n```\n    indented code\nParagraph.\n";
+        assert_eq!(markdown_prose(doc), ["Paragraph."]);
+
+        // Lists: hard-wrapped items and their continuation lines are paragraph text.
+        let doc = "\
+- Top item
+    - Nested item that is long and
+      wraps onto the next line.
+        - Deeper item that also
+          wraps.
+
+    - Nested item after a blank line.
+1. Numbered item
+       with a deeply indented continuation.
+";
+        assert_eq!(markdown_prose(doc), doc.lines().filter(|l| !l.is_empty()).collect::<Vec<_>>());
+
+        // Headings, quotes and list items count as paragraphs.
+        let doc = "# Heading\n    not code\n> Quote\n    not code\n- Item\n    not code\n";
+        assert_eq!(markdown_prose(doc), doc.lines().collect::<Vec<_>>());
     }
 
     #[test]
@@ -579,6 +942,54 @@ Closing prose.
                 None,
                 None,
                 Some("Closing prose."),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_highlighter_markdown_lost_fences() {
+        // The highlighter hands fenced code to the fence's language. Some don't return at the
+        // closing fence (a YAML block scalar at the end, an unmatched `'` in sh), which leaves the
+        // highlighter inside a fence for the rest of the file, and inverts every later fence.
+        let doc = "\
+Setup:
+```yaml
+- run: |
+    cargo build
+```
+Prose after yaml.
+```sh
+echo it's fine
+```
+Prose after sh.
+~~~
+tilde fence body
+~~~
+```rust
+fn main() {}
+```
+Closing prose.
+";
+        assert_eq!(
+            check_doc(Some(language("markdown")), doc),
+            [
+                strs(&["Setup:"]),
+                None,
+                None,
+                None,
+                None,
+                strs(&["Prose after yaml."]),
+                None,
+                None,
+                None,
+                strs(&["Prose after sh."]),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                strs(&["Closing prose."]),
             ]
         );
     }
@@ -721,5 +1132,54 @@ fn main() {
             check_doc(None, prose),
             [strs(&["Plain text."]), strs(&[]), strs(&["  Indented text."])]
         );
+    }
+
+    #[test]
+    fn test_highlighter_kinds() {
+        use TextKind::{CodeString, Prose};
+
+        let kinds = |language: Option<&'static Language>, line: &str| {
+            let mut res = check_doc_with_kinds(language, line);
+            assert_eq!(res.len(), 1);
+            res.pop().flatten().unwrap_or_default()
+        };
+        let owned = |v: &[(&str, TextKind)]| -> Vec<(String, TextKind)> {
+            v.iter().map(|&(s, k)| (s.to_string(), k)).collect()
+        };
+
+        // Only string literals in code are code strings.
+        let rust = Some(language("rust"));
+        assert_eq!(
+            kinds(rust, "let s = \"a string\"; // a comment"),
+            owned(&[("\"a string\"", CodeString), ("// a comment", Prose)])
+        );
+        assert_eq!(
+            kinds(rust, "/// Docs with `code`."),
+            owned(&[("/// Docs with `code`.", Prose)])
+        );
+        let python = Some(language("python"));
+        assert_eq!(
+            kinds(python, "x = 'text' # note"),
+            owned(&[("'text'", CodeString), ("# note", Prose)])
+        );
+
+        // Data formats only check comments.
+        assert_eq!(
+            kinds(Some(language("json")), "{\"key\": \"value\"} // note"),
+            owned(&[("// note", Prose)])
+        );
+
+        // Markdown's link text and inline code are prose.
+        assert_eq!(
+            kinds(Some(language("markdown")), "Read [the docs](https://example.com) and `code`."),
+            owned(&[("Read [the docs](", Prose), (") and `code`.", Prose)])
+        );
+
+        // So are commit messages and plain text.
+        assert_eq!(
+            kinds(Some(language("git-commit")), "Fix \"quoted\" text"),
+            owned(&[("Fix \"quoted\" text", Prose)])
+        );
+        assert_eq!(kinds(None, "Plain \"text\""), owned(&[("Plain \"text\"", Prose)]));
     }
 }
