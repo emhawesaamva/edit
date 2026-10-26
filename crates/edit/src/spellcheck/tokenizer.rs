@@ -30,6 +30,23 @@ use super::MAX_WORD_LEN;
 use crate::simd::memchr2;
 use crate::unicode::Utf8Chars;
 
+/// What kind of text a segment is. It decides how backslashes are read.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TextKind {
+    /// Prose, comments, Markdown and commit messages: a `\` inside a run is part of a path,
+    /// a registry key or a LaTeX command.
+    Prose,
+    /// A string literal in code: `\n`, `\x41`, `\u{...}`, `\'` are escape sequences.
+    CodeString,
+}
+
+/// Calls `f` with the byte range of every candidate word in `text`, reading it as `kind`.
+// SKELETON (round 1 fixes): `kind` is ignored until the tokenizer part implements it.
+pub fn for_each_word_in(text: &[u8], kind: TextKind, f: impl FnMut(Range<usize>)) {
+    _ = kind;
+    for_each_word(text, f)
+}
+
 /// Calls `f` with the byte range of every candidate word in `text`.
 pub fn for_each_word(text: &[u8], mut f: impl FnMut(Range<usize>)) {
     let len = text.len();
