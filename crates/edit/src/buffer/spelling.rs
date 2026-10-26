@@ -893,6 +893,198 @@ A paragraph that is hard wrapped
     }
 
     #[test]
+    fn test_collect_markdown_list_fences() {
+        let _g = shared_globals();
+        // A fence on a list marker line used to be prose. Its closing fence then opened a fence,
+        // which skipped prose until the next fence line, and checked the code after that.
+        let doc = "\
+# Setup
+
+1. ```bash
+   npm install
+   ```
+2. Run teh build.
+
+## Usage
+
+```
+tool --flag
+```
+
+Then check the wrod output.
+
+```
+baz qux
+```
+
+More speling here.
+";
+        let expected = [(5, "teh"), (13, "wrod"), (19, "speling")];
+        let mut tb = buffer(Some("markdown"), doc);
+        assert_every_window(&mut tb, &expected);
+
+        let doc = "Intro.\n\n- ```sh\n  npm install\n  ```\n- Then teh step.\n\nAfter wrod.\n";
+        let mut tb = buffer(Some("markdown"), doc);
+        assert_every_window(&mut tb, &[(5, "teh"), (7, "wrod")]);
+
+        let doc = "+ ```\n  code wierd\n  ```\n\nAfter teh.\n";
+        let mut tb = buffer(Some("markdown"), doc);
+        assert_every_window(&mut tb, &[(4, "teh")]);
+
+        // A fence opened inside an item is closed relative to the item's text.
+        let doc = "- Step one:\n   ```sh\n    echo wierd\n    ```\nThen teh prose.\n";
+        let mut tb = buffer(Some("markdown"), doc);
+        assert_every_window(&mut tb, &[(4, "teh")]);
+
+        // And in a nested item, indented by 4.
+        let doc = "- a\n  - b\n    ```sh\n    echo wierd\n    ```\n  - c teh\n";
+        let mut tb = buffer(Some("markdown"), doc);
+        assert_every_window(&mut tb, &[(5, "teh")]);
+    }
+
+    #[test]
+    fn test_collect_markdown_list_continuation() {
+        let _g = shared_globals();
+        // Paragraphs in list items after a blank line used to be indented code.
+        let doc = "\
+- First item
+
+    Continuation paragraph with teh typo.
+
+    - nested item with wrod
+
+Back to top level speling.
+
+1. Open the portal.
+
+    Then recieve the key.
+
+- item
+
+\tTab continuation with acheive.
+
+- a
+  - b
+
+  more a text
+
+    continuation with freind
+
+- item
+
+      code wierd
+
+After coment.
+";
+        let expected = [
+            (2, "teh"),
+            (4, "wrod"),
+            (6, "speling"),
+            (10, "recieve"),
+            (14, "acheive"),
+            (21, "freind"),
+            (27, "coment"),
+        ];
+        let mut tb = buffer(Some("markdown"), doc);
+        assert_every_window(&mut tb, &expected);
+    }
+
+    #[test]
+    fn test_collect_markdown_front_matter() {
+        let _g = shared_globals();
+        // Obsidian notes, Jekyll pages, etc.
+        let doc = "\
+---
+tags: [mispeled, wierd]
+aliases:
+  - Teh Alias
+---
+# A title with wrod
+
+Body with speling.
+";
+        let mut tb = buffer(Some("markdown"), doc);
+        assert_every_window(&mut tb, &[(5, "wrod"), (7, "speling")]);
+
+        // A thematic break at the start isn't front matter.
+        let doc = "---\n\nIntro wrod after a rule.\n\n---\n\nMore teh.\n";
+        let mut tb = buffer(Some("markdown"), doc);
+        assert_every_window(&mut tb, &[(2, "wrod"), (6, "teh")]);
+
+        // Front matter that's never closed ends at the first line that can't be YAML.
+        let doc = "---\ntitle: wierd\nSome intro with teh.\n";
+        let mut tb = buffer(Some("markdown"), doc);
+        assert_every_window(&mut tb, &[(2, "teh")]);
+
+        // Longer than the distance between two checkpoints.
+        let mut doc = "---\n".to_string();
+        for i in 0..3 * MARKDOWN_INTERVAL {
+            doc.push_str(&format!("key{i}: wierd\n"));
+        }
+        doc.push_str("...\nBody with teh.\n");
+        let mut tb = buffer(Some("markdown"), &doc);
+        assert_every_window(&mut tb, &[(3 * MARKDOWN_INTERVAL + 2, "teh")]);
+    }
+
+    #[test]
+    fn test_collect_markdown_list_edits() {
+        let _g = shared_globals();
+        // Front matter and lists across several checkpoints. The list column and front matter
+        // state are part of each checkpoint, and edits must invalidate them like any other state.
+        let mut doc = "---\n".to_string();
+        for i in 0..MARKDOWN_INTERVAL + 4 {
+            doc.push_str(&format!("key{i}: wierd\n"));
+        }
+        doc.push_str("---\n");
+        for _ in 0..4 {
+            doc.push_str("1. ```sh\n   wierd code\n   ```\n2. Run teh step.\n\n");
+            doc.push_str("    Continuation teh.\n\n    - nested teh\n      ```\n      wierd\n");
+            doc.push_str("      ```\n\n      More teh.\n\n");
+        }
+        let mut tb = buffer(Some("markdown"), &doc);
+        let original = assert_like_fresh(&mut tb);
+        assert_eq!(original.len(), 16);
+        assert!(original.iter().all(|(_, w)| w == "teh"), "{original:?}");
+
+        // Removing the front matter's opening line checks its lines.
+        tb.cursor_move_to_offset(0);
+        tb.delete(CursorMovement::Grapheme, 4);
+        let without = assert_like_fresh(&mut tb);
+        assert_eq!(
+            without.iter().filter(|(_, w)| w == "wierd").count(),
+            MARKDOWN_INTERVAL as usize + 4
+        );
+        tb.undo();
+        assert_eq!(assert_like_fresh(&mut tb), original);
+
+        // Unindenting the last list item's continuation (far below the first checkpoint)
+        // ends the list, so the nested item's fence below it isn't one anymore.
+        let lines: Vec<_> = doc.lines().collect();
+        let y = lines.iter().rposition(|&l| l == "    Continuation teh.").unwrap() as CoordType;
+        tb.cursor_move_to_logical(Point { x: 0, y });
+        tb.delete(CursorMovement::Grapheme, 4);
+        let unindented = assert_like_fresh(&mut tb);
+        assert_eq!(unindented.last(), Some(&(y + 4, "wierd".to_string())));
+        tb.undo();
+        assert_eq!(assert_like_fresh(&mut tb), original);
+
+        // Removing the first item's fence makes its code prose.
+        // (The fence that its closing line opens ends at the next item.)
+        let y = MARKDOWN_INTERVAL + 6;
+        tb.cursor_move_to_logical(Point { x: 3, y });
+        tb.delete(CursorMovement::Grapheme, 3);
+        let removed = assert_like_fresh(&mut tb);
+        assert_eq!(removed[0], (y + 1, "wierd".to_string()));
+        assert_eq!(removed[1..], original);
+        tb.undo();
+        assert_eq!(assert_like_fresh(&mut tb), original);
+        tb.redo();
+        assert_eq!(assert_like_fresh(&mut tb), removed);
+        tb.undo();
+        assert_eq!(assert_like_fresh(&mut tb), original);
+    }
+
+    #[test]
     fn test_collect_git_commit() {
         let _g = shared_globals();
         let doc = "\
@@ -951,6 +1143,30 @@ fn mispeled_fn(speling: u32) {
         assert_eq!(collect(&mut tb), ["coment", "wierd"]);
     }
 
+    #[test]
+    fn test_collect_xml_comments() {
+        let _g = shared_globals();
+        // A comment that ends on the line it starts on used to be masked like a tag.
+        let doc = "\
+<!-- a coment -->
+<root><!-- teh note --><child attr=\"wrod\"/></root>
+<!-- <div class=\"speling\">old</div> -->
+<![CDATA[Some untill text]]>
+<!DOCTYPE html>
+<!--
+multi line mesage
+-->
+<!-- a --><!-- freind -->
+";
+        let mut tb = buffer(Some("xml"), doc);
+        assert_eq!(collect(&mut tb), ["coment", "teh", "mesage"]);
+
+        // Markdown's single-line HTML comments stay unchecked, so that directives aren't flagged.
+        let doc = "<!-- markdownlint-disable MD033 -->\n<!-- teh note -->\n";
+        let mut tb = buffer(Some("markdown"), doc);
+        assert_eq!(collect(&mut tb), [] as [&str; 0]);
+    }
+
     /// Scope, highlighter and tokenizer together: `for_each_segment()` picks the `TextKind`,
     /// and the tokenizer reads `\`, `%` and `\'` by it. String literals in code are read as code
     /// (escapes and printf specs separate words), and everything else is read as prose
@@ -999,6 +1215,57 @@ In `code` and [link tetx](https://example.com/speling) too.
         assert_eq!(collect(&mut tb), ["teh"]);
         let mut tb = buffer(Some("git-commit"), doc);
         assert_eq!(collect(&mut tb), ["teh"]);
+
+        // PowerShell and SQL strings are verbatim: `\` is part of a path in them, not an escape.
+        // As code strings, these paths were flagged in pieces (ocuments, icrosoft, uarterly, ...).
+        let doc = r#"$docs = "$env:USERPROFILE\Documents\Reports"
+$p = 'C:\Program Files\Microsoft Office\root'
+$key = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion'
+$share = '\\fileserver\Finance\Quarterly Reports'
+$h = @"
+Logs go to C:\Temp\Log Files\archive with teh rest
+"@
+Write-Host "Found $count itmes in $path"
+# a coment about C:\Program Files\Microsoft Office
+<# a block coment #>
+"#;
+        let mut tb = buffer(Some("powershell"), doc);
+        assert_eq!(collect(&mut tb), ["teh", "itmes", "coment", "coment"]);
+
+        let doc = r"BULK INSERT dbo.Staging FROM 'C:\Data Files\Imports\vendor.csv';
+SELECT * FROM t WHERE path = '\\fileserver\Finance\Quarterly Reports';
+SELECT 'Domain\UserNmae teh' AS login;
+-- a coment
+/* a block coment */
+";
+        let mut tb = buffer(Some("sql"), doc);
+        assert_eq!(collect(&mut tb), ["teh", "coment", "coment"]);
+    }
+
+    /// The rest of [`TextKind::VerbatimString`](tokenizer::TextKind::VerbatimString), which the
+    /// tokenizer reads as prose until fix-r2-tokenizer lands. Re-enable this test along with it.
+    #[test]
+    #[ignore = "needs fix-r2-tokenizer"]
+    fn test_collect_verbatim_strings() {
+        let _g = shared_globals();
+
+        // `` `n `` and `` `t `` are escapes. As prose, two of them mask the text between them
+        // like Markdown inline code. `''` is an apostrophe, and `$usrname` a variable.
+        let doc = r#"Write-Host "Line1`nThe quick fox jumpd`nLine3"
+Write-Host "Done`nNext wrod`tTabbed"
+$x = 'It isn''t wierd'
+Write-Host "Hello $usrname, $cnt files"
+"#;
+        let mut tb = buffer(Some("powershell"), doc);
+        assert_eq!(collect(&mut tb), ["jumpd", "wrod", "wierd"]);
+
+        // `N'...'` is a Unicode string, `''` an apostrophe and `%ld` a printf spec (RAISERROR).
+        let doc = r"SELECT N'Hello world', N'Welcome back';
+SELECT 'It isn''t wierd';
+RAISERROR('Found %ld itmes', 16, 1);
+";
+        let mut tb = buffer(Some("sql"), doc);
+        assert_eq!(collect(&mut tb), ["wierd", "itmes"]);
     }
 
     #[test]

@@ -40,6 +40,8 @@ pub enum Scope {
     GitCommit,
     /// Comments and strings.
     Code,
+    /// Comments and strings, in a language whose strings don't use `\` escapes (PowerShell, SQL).
+    CodeVerbatim,
     /// Comments only (data formats, whose strings are mostly identifiers).
     CommentsOnly,
 }
@@ -57,6 +59,8 @@ impl Scope {
             "git-commit" => Self::GitCommit,
             // Patches are mostly code and other people's prose. Underlining them is just noise.
             "diff" => Self::Off,
+            // `\` is a path separator in their strings, not an escape.
+            "powershell" | "sql" => Self::CodeVerbatim,
             // Data formats: Their strings are mostly keys, paths and identifiers.
             "git-rebase" | "ignore" | "json" | "properties" | "toml" | "xml" | "yaml" => {
                 Self::CommentsOnly
@@ -105,7 +109,9 @@ impl Scope {
             ),
             // `#` lines are comments, and `diff --git` is a header.
             Self::GitCommit => matches!(kind, HighlightKind::Other),
-            Self::Code => matches!(kind, HighlightKind::Comment | HighlightKind::String),
+            Self::Code | Self::CodeVerbatim => {
+                matches!(kind, HighlightKind::Comment | HighlightKind::String)
+            }
             Self::CommentsOnly => matches!(kind, HighlightKind::Comment),
         }
     }
@@ -116,7 +122,7 @@ impl Scope {
             Self::Off => true,
             Self::Markdown => md.next_line(line),
             Self::GitCommit => !starts_idle,
-            Self::Prose | Self::Code | Self::CommentsOnly => false,
+            Self::Prose | Self::Code | Self::CodeVerbatim | Self::CommentsOnly => false,
         }
     }
 
@@ -142,11 +148,21 @@ impl Scope {
         let to_line = |off: usize| off.saturating_sub(line_offset).min(line.len());
         // Only code has string literals. Markdown's strings are link text and inline code, which are prose.
         // A string that runs into a comment (`"a"// b`) is one segment, and comments are prose, too.
-        let kind = |string: bool, comment: bool| {
-            if self == Self::Code && string && !comment {
-                TextKind::CodeString
-            } else {
-                TextKind::Prose
+        let kind = |string: bool, comment: bool| match self {
+            _ if !string || comment => TextKind::Prose,
+            Self::Code => TextKind::CodeString,
+            Self::CodeVerbatim => TextKind::VerbatimString,
+            _ => TextKind::Prose,
+        };
+        // The tokenizer masks `<!` through the next `>` like a tag, which would hide an XML comment
+        // that ends on the line it starts on. So its `<!--` is cut off. (Markdown's HTML comments
+        // stay masked, so that directives like `<!-- markdownlint-disable -->` aren't flagged.)
+        let mut f = |mut seg: Range<usize>, kind: TextKind| {
+            if self == Self::CommentsOnly && line[seg.clone()].starts_with(b"<!--") {
+                seg.start += 4;
+            }
+            if !seg.is_empty() {
+                f(seg, kind);
             }
         };
         // How far we got. Clamping each span's start to it keeps the output ascending,
@@ -193,17 +209,38 @@ impl Scope {
 }
 
 /// Markdown's block structure at the start of a line, as far as spell checking cares:
-/// whether the line is inside a fenced code block, and whether an indented line would be code.
+/// whether the line is in YAML front matter or a fenced code block, and whether an indented line
+/// would be code.
 ///
-/// It follows CommonMark, minus containers: Fences and indented code blocks are recognized
-/// at the start of a line only (not after `>`), and list items don't shift the indentation.
-/// Also, anything that isn't blank or code counts as paragraph text (headings, too).
+/// It follows CommonMark, minus block quotes: Fences and indented code blocks are recognized at the
+/// start of a line and after a list marker (not after `>`). Their indentation is measured from the
+/// content column of the list item they're in, but only the innermost item's column is known.
+/// A line that's indented less than that (and doesn't continue a paragraph) measures from its own
+/// indentation instead. Also, anything that isn't blank or code counts as paragraph text
+/// (headings, too).
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct MarkdownState {
+    /// Where we are relative to the YAML front matter.
+    front: FrontMatter,
     /// The fenced code block we're in, if any.
     fence: Option<Fence>,
     /// What an indented line would continue.
     block: Block,
+    /// The content column of the list item we're in (the indentation of its text), or 0.
+    list: usize,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+enum FrontMatter {
+    /// The next line is the first line of the file.
+    #[default]
+    Start,
+    /// The first line was `---`.
+    Opened,
+    /// After the first line of front matter.
+    Inside,
+    /// After the front matter, or there's none.
+    Done,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -212,6 +249,8 @@ struct Fence {
     ch: u8,
     /// The length of the opening fence. The closing one must be at least as long.
     len: usize,
+    /// The column the closing fence's indentation is measured from (the list item's content column).
+    base: usize,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
@@ -223,20 +262,25 @@ enum Block {
     /// Paragraph text, which includes list items, headings, etc.
     /// Indented code can't interrupt a paragraph, so an indented line continues it.
     Paragraph,
-    /// Indented code. Blank lines don't end it, only a line that isn't indented does.
+    /// Indented code. Blank lines don't end it, only a line that's indented less does.
     IndentedCode,
 }
 
 impl MarkdownState {
-    /// Advances the state past `line` (without its trailing newline).
-    /// Returns whether the line is code: a fence, inside a fenced code block, or indented code.
+    /// Advances the state past `line` (without its trailing newline). Returns whether the line
+    /// is code: front matter, a fence, inside a fenced code block, or indented code.
     pub fn next_line(&mut self, line: &[u8]) -> bool {
+        if self.front != FrontMatter::Done && self.next_front_matter_line(line) {
+            return true;
+        }
+
         let (indent, rest) = split_indent(line);
 
         if let Some(fence) = self.fence {
-            // A closing fence has up to 3 spaces of indentation, at least as many
-            // of the same character as the opening one, and nothing but whitespace after them.
-            if indent < 4
+            // A closing fence has up to 3 spaces of indentation (beyond the list item's text),
+            // at least as many of the same character as the opening one,
+            // and nothing but whitespace after them.
+            if indent < fence.base + 4
                 && let Some((ch, len)) = fence_run(rest)
                 && ch == fence.ch
                 && len >= fence.len
@@ -244,8 +288,15 @@ impl MarkdownState {
             {
                 self.fence = None;
                 self.block = Block::Fresh;
+                return true;
             }
-            return true;
+            // A line that's indented less than the list item's text ends the item,
+            // and the fence along with it (e.g. a fence that was never closed).
+            if rest.is_empty() || indent >= fence.base {
+                return true;
+            }
+            self.fence = None;
+            self.block = Block::Fresh;
         }
 
         if rest.is_empty() {
@@ -255,27 +306,91 @@ impl MarkdownState {
             return false;
         }
 
-        if indent >= 4 {
-            let code = match self.block {
+        let item = list_marker_width(rest).filter(|_| {
+            // Outside of a list, only a bullet or `1.` can start one in the middle of a paragraph.
+            // Otherwise, hard-wrapped text like "since\n2024. Then" would be a list item.
+            self.block != Block::Paragraph || self.list > 0 || can_interrupt_paragraph(rest)
+        });
+        // Indented code needs 4 columns more than the list item's text.
+        let code = indent >= self.list + 4
+            && match self.block {
                 // Nested list items (after a blank line) are indented, too, but they aren't code.
-                Block::Fresh => !is_markdown_list_item(rest),
+                Block::Fresh => item.is_none(),
                 Block::Paragraph => false,
                 Block::IndentedCode => true,
             };
-            self.block = if code { Block::IndentedCode } else { Block::Paragraph };
-            return code;
+        if code {
+            self.block = Block::IndentedCode;
+            return true;
         }
 
-        if let Some((ch, len)) = fence_run(rest)
-            // The info string of a backtick fence can't contain backticks. Otherwise it's inline code.
-            && (ch == b'~' || !rest[len..].contains(&b'`'))
+        if let Some(width) = item {
+            self.block = Block::Paragraph;
+            // A list marker that's indented 4 columns more than the item's text isn't one.
+            // It's paragraph text (or code after a blank line, but it's checked anyway).
+            if indent >= self.list + 4 {
+                return false;
+            }
+            self.list = indent + width;
+            // `- ```sh`: A fence right after the list marker.
+            if let Some((ch, len)) = fence_open(&rest[width..]) {
+                self.fence = Some(Fence { ch, len, base: self.list });
+                return true;
+            }
+            return false;
+        }
+
+        let fence = if indent < self.list + 4 { fence_open(rest) } else { None };
+        // A line indented less than the item's text isn't part of the item, unless it continues
+        // the item's paragraph (which a fence, heading or thematic break can't). The item it's part
+        // of instead (if any) has its text at this indentation at most. Close enough.
+        if indent < self.list
+            && (self.block != Block::Paragraph
+                || fence.is_some()
+                || is_atx_heading(rest)
+                || is_thematic_break(rest))
         {
-            self.fence = Some(Fence { ch, len });
+            self.list = indent;
+        }
+        if let Some((ch, len)) = fence {
+            self.fence = Some(Fence { ch, len, base: self.list });
             return true;
         }
 
         self.block = Block::Paragraph;
         false
+    }
+
+    /// YAML front matter is a `---` line at the start of the file, up to and including the next
+    /// `---` or `...` line. Returns whether `line` is part of it.
+    fn next_front_matter_line(&mut self, line: &[u8]) -> bool {
+        let is_delimiter = |delimiter: &[u8]| {
+            line.strip_prefix(delimiter)
+                .is_some_and(|rest| rest.iter().all(|&b| b == b' ' || b == b'\t'))
+        };
+
+        self.front = match self.front {
+            FrontMatter::Start if is_delimiter(b"---") => FrontMatter::Opened,
+            FrontMatter::Opened | FrontMatter::Inside
+                if is_delimiter(b"---") || is_delimiter(b"...") =>
+            {
+                FrontMatter::Done
+            }
+            // `---` and a blank line is a thematic break. Front matter starts with a key.
+            FrontMatter::Opened if split_indent(line).1.is_empty() => {
+                self.front = FrontMatter::Done;
+                return false;
+            }
+            // Front matter that's never closed ends at the first line that can't be YAML.
+            FrontMatter::Opened | FrontMatter::Inside if is_front_matter_like(line) => {
+                FrontMatter::Inside
+            }
+            _ => {
+                self.front = FrontMatter::Done;
+                return false;
+            }
+        };
+        true
     }
 }
 
@@ -305,6 +420,12 @@ fn fence_run(text: &[u8]) -> Option<(u8, usize)> {
     (len >= 3).then_some((ch, len))
 }
 
+/// Like [`fence_run`], but only if `text` is an opening fence:
+/// The info string of a backtick fence can't contain backticks. Otherwise it's inline code.
+fn fence_open(text: &[u8]) -> Option<(u8, usize)> {
+    fence_run(text).filter(|&(ch, len)| ch == b'~' || !text[len..].contains(&b'`'))
+}
+
 /// Whether `line` (with leading whitespace already trimmed) starts with a list marker
 /// (`-`, `*`, `+`, `1.` or `1)`), followed by a space or tab.
 fn is_markdown_list_item(line: &[u8]) -> bool {
@@ -315,6 +436,55 @@ fn is_markdown_list_item(line: &[u8]) -> bool {
         _ => return false,
     };
     matches!(line.get(marker_len), Some(b' ' | b'\t'))
+}
+
+/// If `line` (with leading whitespace already trimmed) is a list item, returns the width of its
+/// marker and the whitespace after it, which is where the item's text starts.
+fn list_marker_width(line: &[u8]) -> Option<usize> {
+    // `* * *` is a thematic break, not a list item.
+    if !is_markdown_list_item(line) || is_thematic_break(line) {
+        return None;
+    }
+    let marker = line.iter().take_while(|b| b.is_ascii_digit()).count() + 1;
+    let spaces = line[marker..].iter().take_while(|&&b| b == b' ').count();
+    // After 5 or more spaces (or a tab), the text starts 1 column after the marker.
+    // It's indented code then, which is good enough for a tab, too.
+    Some(marker + if (1..=4).contains(&spaces) { spaces } else { 1 })
+}
+
+/// Whether the list item `line` (with leading whitespace already trimmed) can start a list in the
+/// middle of a paragraph: if it's a bullet, or if it's numbered 1.
+fn can_interrupt_paragraph(line: &[u8]) -> bool {
+    let digits = line.iter().take_while(|b| b.is_ascii_digit()).count();
+    match line[..digits].split_last() {
+        None => true,
+        Some((&last, zeros)) => last == b'1' && zeros.iter().all(|&b| b == b'0'),
+    }
+}
+
+/// Whether `line` (with leading whitespace already trimmed) is a thematic break:
+/// 3 or more `-`, `*` or `_`, and nothing else but spaces and tabs.
+fn is_thematic_break(line: &[u8]) -> bool {
+    let Some(&ch @ (b'-' | b'*' | b'_')) = line.first() else {
+        return false;
+    };
+    line.iter().all(|&b| b == ch || b == b' ' || b == b'\t')
+        && line.iter().filter(|&&b| b == ch).count() >= 3
+}
+
+/// Whether `line` (with leading whitespace already trimmed) is an ATX heading (`# Heading`).
+fn is_atx_heading(line: &[u8]) -> bool {
+    let hashes = line.iter().take_while(|&&b| b == b'#').count();
+    (1..=6).contains(&hashes) && matches!(line.get(hashes), None | Some(b' ' | b'\t'))
+}
+
+/// Whether `line` can be part of YAML front matter: blank, indented, a comment,
+/// a sequence item, or a line with a key.
+fn is_front_matter_like(line: &[u8]) -> bool {
+    match line.first() {
+        None | Some(b' ' | b'\t' | b'#' | b'-') => true,
+        Some(_) => line.contains(&b':'),
+    }
 }
 
 #[cfg(test)]
@@ -435,8 +605,8 @@ mod tests {
     #[test]
     fn test_for_language_covers_all_languages() {
         // NOTE: If this fails after merging upstream, a language was added or renamed.
-        // Decide whether its strings are prose (Code) or data (CommentsOnly) and update
-        // both `Scope::for_language` and this table.
+        // Decide whether its strings are prose (Code, or CodeVerbatim if `\` isn't an escape in
+        // them) or data (CommentsOnly) and update both `Scope::for_language` and this table.
         let expected = [
             ("c", Scope::Code),
             ("cpp", Scope::Code),
@@ -454,13 +624,13 @@ mod tests {
             ("lua", Scope::Code),
             ("markdown", Scope::Markdown),
             ("odin", Scope::Code),
-            ("powershell", Scope::Code),
+            ("powershell", Scope::CodeVerbatim),
             ("properties", Scope::CommentsOnly),
             ("python", Scope::Code),
             ("ruby", Scope::Code),
             ("rust", Scope::Code),
             ("shellscript", Scope::Code),
-            ("sql", Scope::Code),
+            ("sql", Scope::CodeVerbatim),
             ("toml", Scope::CommentsOnly),
             ("xml", Scope::CommentsOnly),
             ("yaml", Scope::CommentsOnly),
@@ -499,6 +669,7 @@ mod tests {
         assert!(Scope::Markdown.needs_highlighter());
         assert!(Scope::GitCommit.needs_highlighter());
         assert!(Scope::Code.needs_highlighter());
+        assert!(Scope::CodeVerbatim.needs_highlighter());
         assert!(Scope::CommentsOnly.needs_highlighter());
     }
 
@@ -506,7 +677,7 @@ mod tests {
     fn test_needs_state() {
         use Scope::*;
 
-        for scope in [Off, Prose, Markdown, GitCommit, Code, CommentsOnly] {
+        for scope in [Off, Prose, Markdown, GitCommit, Code, CodeVerbatim, CommentsOnly] {
             assert_eq!(scope.needs_idle_state(), scope == GitCommit, "{scope:?}");
             assert_eq!(scope.needs_markdown_state(), scope == Markdown, "{scope:?}");
             // Both states are only meaningful along with highlights.
@@ -528,10 +699,11 @@ mod tests {
             MarkupStrikethrough,
             MarkupList,
         ];
-        let table: [(Scope, &[HighlightKind]); 4] = [
+        let table: [(Scope, &[HighlightKind]); 5] = [
             (Scope::Markdown, &markdown),
             (Scope::GitCommit, &[Other]),
             (Scope::Code, &[Comment, String]),
+            (Scope::CodeVerbatim, &[Comment, String]),
             (Scope::CommentsOnly, &[Comment]),
         ];
 
@@ -572,7 +744,13 @@ mod tests {
 
     #[test]
     fn test_segments_empty_highlights() {
-        for scope in [Scope::Markdown, Scope::GitCommit, Scope::Code, Scope::CommentsOnly] {
+        for scope in [
+            Scope::Markdown,
+            Scope::GitCommit,
+            Scope::Code,
+            Scope::CodeVerbatim,
+            Scope::CommentsOnly,
+        ] {
             assert_eq!(segments(scope, "hello world", 0, &[]), [], "{scope:?}");
         }
     }
@@ -604,6 +782,7 @@ mod tests {
 
         // Code only checks the link text, which is a string.
         assert_eq!(segments(Scope::Code, line, off, &hl), [22..26]);
+        assert_eq!(segments(Scope::CodeVerbatim, line, off, &hl), [22..26]);
         assert_eq!(segments(Scope::CommentsOnly, line, off, &hl), []);
         assert_eq!(segments(Scope::GitCommit, line, off, &hl), [0..4, 12..22, 26..28, 31..35]);
     }
@@ -635,7 +814,7 @@ mod tests {
     #[allow(clippy::single_range_in_vec_init)]
     fn test_segments_kinds() {
         use HighlightKind::*;
-        use TextKind::{CodeString, Prose};
+        use TextKind::{CodeString, Prose, VerbatimString};
 
         // `let s = "some text"; // a comment`
         let line = r#"let s = "some text"; // a comment"#;
@@ -678,6 +857,26 @@ mod tests {
         // Empty spans don't change the kind.
         let hl = [span(0, String), span(2, Comment), span(2, String), span(4, Other)];
         assert_eq!(segments_with_kinds(Scope::Code, "\"ab\"", 0, &hl), [(0..4, CodeString)]);
+
+        // PowerShell and SQL strings are verbatim. Comments are prose, as in all code.
+        let line = r#""ab" + /* c */ + "d""#;
+        let hl = [
+            span(0, String),
+            span(4, Other),
+            span(7, Comment),
+            span(14, Other),
+            span(17, String),
+            span(line.len(), Other),
+        ];
+        assert_eq!(
+            segments_with_kinds(Scope::CodeVerbatim, line, 0, &hl),
+            [(0..4, VerbatimString), (7..14, Prose), (17..20, VerbatimString)]
+        );
+        let hl = [span(0, String), span(4, Comment), span(9, Other)];
+        assert_eq!(
+            segments_with_kinds(Scope::CodeVerbatim, "\"ab\"// cd", 0, &hl),
+            [(0..9, Prose)]
+        );
 
         // Markdown's strings are link text and inline code. Commit messages have none.
         let line = "see [the docs](url) now";
@@ -784,6 +983,10 @@ mod tests {
         assert!(!skip(b"``two backticks``"));
         assert!(!skip(b"```inline``` code"));
         assert!(!skip(b"~~strike~~"));
+        assert!(!skip(b"----"));
+
+        // `---` at the start of the file may open front matter. It has no words either way.
+        assert!(skip(b"---"));
     }
 
     #[test]
@@ -797,6 +1000,7 @@ mod tests {
                 assert!(Scope::Off.skip_line(line, idle, &mut md));
                 assert!(!Scope::Prose.skip_line(line, idle, &mut md));
                 assert!(!Scope::Code.skip_line(line, idle, &mut md));
+                assert!(!Scope::CodeVerbatim.skip_line(line, idle, &mut md));
                 assert!(!Scope::CommentsOnly.skip_line(line, idle, &mut md));
             }
             assert!(!Scope::GitCommit.skip_line(line, true, &mut md));
@@ -897,6 +1101,214 @@ Paragraph.
         // Headings, quotes and list items count as paragraphs.
         let doc = "# Heading\n    not code\n> Quote\n    not code\n- Item\n    not code\n";
         assert_eq!(markdown_prose(doc), doc.lines().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_markdown_list_fences() {
+        // A fence right after a list marker. Its closing fence used to open another one,
+        // which skipped the prose after it and checked the code after that.
+        let doc = "\
+# Setup
+
+1. ```bash
+   npm install
+   ```
+2. Run the build.
+
+```sh
+tool --flag
+```
+
+Then check the output.
+";
+        assert_eq!(markdown_prose(doc), ["# Setup", "2. Run the build.", "Then check the output."]);
+
+        let doc = "- ```sh\n  echo hi\n  ```\n\nThen prose after the list.\n";
+        assert_eq!(markdown_prose(doc), ["Then prose after the list."]);
+        let doc = "+ ```\n  code\n  ```\n\nAfter.\n";
+        assert_eq!(markdown_prose(doc), ["After."]);
+        let doc = "* ~~~ text\n  code\n  ~~~\n10) ```\n    code\n    ```\nAfter.\n";
+        assert_eq!(markdown_prose(doc), ["After."]);
+
+        // Later fences without an info string keep their parity.
+        let doc = "\
+1. ```bash
+   npm ci
+   ```
+2. Run the build.
+
+```
+foo --bar
+```
+
+Check this.
+
+```
+baz qux
+```
+
+End.
+";
+        assert_eq!(markdown_prose(doc), ["2. Run the build.", "Check this.", "End."]);
+
+        // A closing fence's indentation is measured from the item's text.
+        let doc = "- Step one:\n   ```sh\n    echo hi\n    ```\nThen prose.\n";
+        assert_eq!(markdown_prose(doc), ["- Step one:", "Then prose."]);
+        let doc = "- item\nlazy line\n  ```\n  code\n    ```\nAfter.\n";
+        assert_eq!(markdown_prose(doc), ["- item", "lazy line", "After."]);
+        // The closing fence of a top-level fence still can't be indented 4 or more.
+        let doc = "- item\n\n```\ncode\n    ```\nstill code\n```\nAfter.\n";
+        assert_eq!(markdown_prose(doc), ["- item", "After."]);
+
+        // A fence in a nested item, indented 4 or more.
+        let doc = "- a\n  - b\n    ```sh\n    echo hi\n    ```\n  - c\n";
+        assert_eq!(markdown_prose(doc), ["- a", "  - b", "  - c"]);
+        let doc = "- a\n    - ```sh\n      echo hi\n      ```\n    - c\n";
+        assert_eq!(markdown_prose(doc), ["- a", "    - c"]);
+        let doc = "1. a\n\n    ```\n    code\n    ```\n\n    More a.\n";
+        assert_eq!(markdown_prose(doc), ["1. a", "    More a."]);
+
+        // A line that's indented less than the item's text ends the item and its fence.
+        let doc = "- ```sh\n  echo hi\n- Next item.\n\nMore prose.\n";
+        assert_eq!(markdown_prose(doc), ["- Next item.", "More prose."]);
+        // But a closing fence closes it.
+        let doc = "1. Run:\n   ```sh\n   npm ci\n```\n2. Next.\n";
+        assert_eq!(markdown_prose(doc), ["1. Run:", "2. Next."]);
+
+        // Not fences.
+        let doc = "- ```code``` and text\n\nAfter.\n";
+        assert_eq!(markdown_prose(doc), ["- ```code``` and text", "After."]);
+        let doc = "-     ```\n  text\n\nAfter.\n";
+        assert_eq!(markdown_prose(doc), ["-     ```", "  text", "After."]);
+        let doc = "Since\n2024. ```\nThat was text.\n";
+        assert_eq!(markdown_prose(doc), doc.lines().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_markdown_list_continuation() {
+        // Paragraphs in a list item after a blank line, indented by 4 or a tab (Python-Markdown,
+        // MkDocs). They used to be indented code, and so did everything up to an unindented line.
+        let doc = "\
+- First item
+
+    Continuation paragraph.
+
+    - nested item
+
+Back to top level.
+
+1. Open the portal.
+
+    Then select the subscription.
+
+2. Click Save.
+
+- item
+
+\tTab continuation.
+";
+        assert_eq!(markdown_prose(doc), doc.lines().filter(|l| !l.is_empty()).collect::<Vec<_>>());
+
+        // From a nested item back to the parent's text, and then the parent's indented code.
+        let doc = "- a\n  - b\n\n  more a text\n\n    continuation\n\n      code in a\n";
+        assert_eq!(markdown_prose(doc), ["- a", "  - b", "  more a text", "    continuation"]);
+        let doc = "- a\n    - b\n\n    more a text\n\n        code in a\n";
+        assert_eq!(markdown_prose(doc), ["- a", "    - b", "    more a text"]);
+
+        // Indented code needs 4 columns more than the item's text.
+        let doc = "- item\n\n      code\n\n1. item\n\n       code\n\n    1. item\n\nAfter.\n";
+        assert_eq!(markdown_prose(doc), ["- item", "1. item", "    1. item", "After."]);
+        let doc = "1. item\n\n    $ npm text\n";
+        assert_eq!(markdown_prose(doc), ["1. item", "    $ npm text"]);
+        let doc = "- item\n\n      code\n    more text\n";
+        assert_eq!(markdown_prose(doc), ["- item", "    more text"]);
+
+        // A line indented less than the item's text after a blank line ends the item.
+        let doc = "- item\n\nParagraph.\n\n    code\n";
+        assert_eq!(markdown_prose(doc), ["- item", "Paragraph."]);
+        // So do headings and thematic breaks, even without one.
+        let doc = "- item\n# Heading\n\n    code\n";
+        assert_eq!(markdown_prose(doc), ["- item", "# Heading"]);
+        let doc = "- item\n***\n\n    code\n";
+        assert_eq!(markdown_prose(doc), ["- item", "***"]);
+        // Lazy continuation lines don't.
+        let doc = "- item\nlazy\n\n    more item\n";
+        assert_eq!(markdown_prose(doc), ["- item", "lazy", "    more item"]);
+
+        // Not list items: a thematic break, a marker that's indented 4 more than the item's text
+        // (or than nothing), and a number in the middle of a paragraph.
+        let doc = "* * *\n\n    code\n";
+        assert_eq!(markdown_prose(doc), ["* * *"]);
+        let doc = "Para\n    - text\n\n    code\n";
+        assert_eq!(markdown_prose(doc), ["Para", "    - text"]);
+        let doc = "Since\n2024. A year.\n\n    code\n";
+        assert_eq!(markdown_prose(doc), ["Since", "2024. A year."]);
+        let doc = "Steps:\n1. A step.\n\n    More step.\n";
+        assert_eq!(markdown_prose(doc), doc.lines().filter(|l| !l.is_empty()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_markdown_front_matter() {
+        // Obsidian, Jekyll, etc.
+        let doc = "\
+---
+tags: [projectx, meeting]
+aliases:
+  - Some Alias
+---
+# Title
+Body text.
+";
+        assert_eq!(markdown_prose(doc), ["# Title", "Body text."]);
+
+        // Closed by `...`, trailing whitespace on either line, and empty.
+        assert_eq!(markdown_prose("--- \ntitle: x\n... \t\nBody.\n"), ["Body."]);
+        assert_eq!(markdown_prose("---\n---\nBody.\n"), ["Body."]);
+
+        // `---` and a blank line is a thematic break, not front matter.
+        // (The `---` itself is skipped either way. It has no words.)
+        let doc = "---\n\nIntro text.\n\n---\n\nMore.\n";
+        assert_eq!(markdown_prose(doc), ["Intro text.", "---", "More."]);
+
+        // Front matter that's never closed ends at the first line that can't be YAML.
+        let doc = "---\ntitle: x\n# comment\n  indented: y\n- item\nSome intro text.\n\nMore.\n";
+        assert_eq!(markdown_prose(doc), ["Some intro text.", "More."]);
+
+        // Only at the very start of the file, and only with exactly 3 dashes.
+        let doc = "Intro.\n---\ntitle: x\n---\n";
+        assert_eq!(markdown_prose(doc), doc.lines().collect::<Vec<_>>());
+        let doc = "\n---\ntags: x\n---\n";
+        assert_eq!(markdown_prose(doc), ["---", "tags: x", "---"]);
+        let doc = " ---\ntags: x\n";
+        assert_eq!(markdown_prose(doc), doc.lines().collect::<Vec<_>>());
+        let doc = "----\ntags: x\n";
+        assert_eq!(markdown_prose(doc), doc.lines().collect::<Vec<_>>());
+
+        // Fences in front matter don't count. After it, they do.
+        let doc = "---\nnote: |\n  ```\n---\nBody.\n```\ncode\n```\nAfter.\n";
+        assert_eq!(markdown_prose(doc), ["Body.", "After."]);
+    }
+
+    #[test]
+    fn test_markdown_state_never_panics() {
+        // Lines made of the characters the state looks at, in every state it gets into.
+        const CHARS: &[u8] = b"  \t\t--**++_01.)`~~#:a\r\xc3\xa9";
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut md = MarkdownState::default();
+        let mut line = Vec::new();
+        for i in 0..50_000 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            line.clear();
+            line.extend(
+                (0..seed % 12).map(|j| CHARS[(seed >> (5 * j + 4)) as usize % CHARS.len()]),
+            );
+            md.next_line(&line);
+            if i % 500 == 0 {
+                md = MarkdownState::default();
+            }
+        }
     }
 
     #[test]
@@ -1135,8 +1547,56 @@ fn main() {
     }
 
     #[test]
+    #[allow(clippy::single_range_in_vec_init)]
+    fn test_highlighter_xml_comments() {
+        let doc = "\
+<!-- a coment -->
+  <root><!-- teh note --><child/></root>
+<!-- <b>x</b> -->
+<![CDATA[Some teh text]]>
+<!DOCTYPE html>
+<!---->
+<!--
+multi line coment
+-->
+<!-- a --><!-- teh -->
+";
+        assert_eq!(
+            check_doc(Some(language("xml")), doc),
+            [
+                // A comment's `<!--` is cut off, so that the tokenizer doesn't mask it like a tag.
+                strs(&[" a coment -->"]),
+                strs(&[" teh note -->"]),
+                // Tags in it are still masked.
+                strs(&[" <b>x</b> -->"]),
+                // Neither CDATA nor a DOCTYPE is a comment.
+                strs(&[]),
+                strs(&[]),
+                strs(&["-->"]),
+                strs(&[]),
+                strs(&["multi line coment"]),
+                strs(&["-->"]),
+                // Only the first one. The tokenizer masks the second.
+                strs(&[" a --><!-- teh -->"]),
+            ]
+        );
+
+        // Other scopes keep the `<!--`. In Markdown, the tokenizer masks single-line HTML comments,
+        // so that `<!-- markdownlint-disable -->` and the like aren't flagged.
+        let line = "<!-- markdownlint-disable -->";
+        assert_eq!(check_doc(Some(language("markdown")), line), [strs(&[line])]);
+        assert_eq!(check_doc(None, line), [strs(&[line])]);
+        let hl = [span(0, HighlightKind::Comment), span(line.len(), HighlightKind::Other)];
+        for scope in [Scope::Markdown, Scope::Code, Scope::CodeVerbatim] {
+            assert_eq!(segments(scope, line, 0, &hl), [0..line.len()], "{scope:?}");
+        }
+        assert_eq!(segments(Scope::CommentsOnly, line, 0, &hl), [4..line.len()]);
+        assert_eq!(segments(Scope::CommentsOnly, "<!--", 0, &hl[..1]), []);
+    }
+
+    #[test]
     fn test_highlighter_kinds() {
-        use TextKind::{CodeString, Prose};
+        use TextKind::{CodeString, Prose, VerbatimString};
 
         let kinds = |language: Option<&'static Language>, line: &str| {
             let mut res = check_doc_with_kinds(language, line);
@@ -1162,6 +1622,27 @@ fn main() {
             kinds(python, "x = 'text' # note"),
             owned(&[("'text'", CodeString), ("# note", Prose)])
         );
+
+        // PowerShell's and SQL's are verbatim: `\` isn't an escape in them.
+        let powershell = Some(language("powershell"));
+        assert_eq!(
+            kinds(powershell, r#"$p = "$env:TEMP\Logs`n" # note"#),
+            owned(&[(r#""$env:TEMP\Logs`n""#, VerbatimString), ("# note", Prose)])
+        );
+        assert_eq!(
+            kinds(powershell, r"Get-Item 'HKLM:\SOFTWARE' <# note #>"),
+            owned(&[(r"'HKLM:\SOFTWARE'", VerbatimString), ("<# note #>", Prose)])
+        );
+        let sql = Some(language("sql"));
+        assert_eq!(
+            kinds(sql, r"SELECT N'C:\Data', 'it''s' -- note"),
+            owned(&[
+                (r"N'C:\Data'", VerbatimString),
+                ("'it''s'", VerbatimString),
+                ("-- note", Prose)
+            ])
+        );
+        assert_eq!(kinds(sql, "/* note */"), owned(&[("/* note */", Prose)]));
 
         // Data formats only check comments.
         assert_eq!(
