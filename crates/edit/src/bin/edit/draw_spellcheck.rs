@@ -37,6 +37,9 @@ pub struct SpellPopup {
     pub message: Option<LocId>,
     /// Whether the list still needs to take the focus. True until the first draw.
     focus: bool,
+    /// The size of the textarea during the first draw, i.e. when the popup opened.
+    /// The popup closes when it changes, because a resize may have re-wrapped the word elsewhere.
+    textarea: Option<Size>,
 }
 
 impl SpellPopup {
@@ -85,7 +88,16 @@ pub fn spell_open(state: &mut State, quiet: bool) {
         return;
     };
 
-    let at = doc.buffer.borrow_mut().spell_word_at_cursor();
+    let mut at = doc.buffer.borrow_mut().spell_word_at_cursor();
+    // The cursor is also "at" a word that ends right before it, so that F7 works right after
+    // typing one. A right-click must hit the word itself though, not the cell after it,
+    // nor the empty space past the end of a line that ends in it.
+    if quiet
+        && let SpellAt::Word(word) = &at
+        && doc.buffer.borrow().cursor_offset() >= word.range.end
+    {
+        at = SpellAt::NoMisspelling;
+    }
     let popup =
         spell_popup_new(doc.buffer.clone(), at, quiet, |word| match spellcheck::dictionary() {
             Some(dict) => spellcheck::suggest(dict, word),
@@ -119,7 +131,7 @@ fn spell_popup_new(
         SpellAt::Loading => (None, Vec::new(), Some(LocId::SpellLoading)),
         SpellAt::Unavailable => (None, Vec::new(), Some(LocId::SpellUnavailable)),
     };
-    Some(SpellPopup { buffer, word, items, message, focus: true })
+    Some(SpellPopup { buffer, word, items, message, focus: true, textarea: None })
 }
 
 fn draw_spell_popup(ctx: &mut Context, state: &mut State, textarea: Size, scroll: Point) {
@@ -127,7 +139,10 @@ fn draw_spell_popup(ctx: &mut Context, state: &mut State, textarea: Size, scroll
         return;
     };
 
-    if !state.documents.active().is_some_and(|doc| Rc::ptr_eq(&doc.buffer, &popup.buffer)) {
+    let same_document =
+        state.documents.active().is_some_and(|doc| Rc::ptr_eq(&doc.buffer, &popup.buffer));
+    let same_size = *popup.textarea.get_or_insert(textarea) == textarea;
+    if !same_document || !same_size {
         state.spell.popup = None;
         ctx.needs_rerender();
         return;
@@ -138,13 +153,29 @@ fn draw_spell_popup(ctx: &mut Context, state: &mut State, textarea: Size, scroll
 
     let pos = {
         let tb = popup.buffer.borrow();
-        let word_pos = popup.word.as_ref().map_or_else(|| tb.cursor_visual_pos(), |w| w.visual_pos);
+        let margin_width = tb.margin_width();
+        let cursor = tb.cursor_visual_pos();
+        let word_pos = popup.word.as_ref().map_or(cursor, |w| w.visual_pos);
         let size = Size {
             // +2 for the list item prefix ("> ") and +2 for the border.
             width: popup.labels().map(label_width).max().unwrap_or(0) + 4,
             height: popup.labels().count() as CoordType + 2,
         };
-        popup_position(textarea, tb.margin_width(), word_pos, scroll, size)
+        // Once the word was scrolled out of view (e.g. with the mouse wheel), the popup closes
+        // instead of covering the menubar or statusbar. The cursor is in or right after the word.
+        // Not during the first draw, whose `scroll` predates `make_cursor_visible()` in `spell_open`.
+        let visible = |pos| is_visible(textarea, margin_width, pos, scroll);
+        if steal_focus || visible(word_pos) || visible(cursor) {
+            Some(popup_position(textarea, margin_width, word_pos, scroll, size))
+        } else {
+            None
+        }
+    };
+
+    let Some(pos) = pos else {
+        state.spell.popup = None;
+        ctx.needs_rerender();
+        return;
     };
 
     let mut activated = None;
@@ -203,14 +234,14 @@ fn label_width(text: &str) -> CoordType {
 
 /// Computes the popup position relative to the textarea's top-left corner.
 ///
-/// * `textarea`: size of the textarea.
+/// * `textarea`: size of the textarea, including the scrollbar in its last column.
 /// * `margin_width`: width of the line number margin inside the textarea.
 /// * `word_pos`: visual position of the word's first character.
 /// * `scroll`: scroll offset of the textarea.
 /// * `popup`: size of the popup, including its border.
 ///
 /// The popup goes below the word, or above it if it only fits there. It's moved left if it would
-/// stick out on the right. Floats don't do either on their own: They're only clipped to the viewport.
+/// cover the scrollbar. Floats don't do either on their own: They're only clipped to the viewport.
 fn popup_position(
     textarea: Size,
     margin_width: CoordType,
@@ -224,9 +255,17 @@ fn popup_position(
     let y = if below + popup.height > textarea.height && above >= 0 { above } else { below };
 
     let x = margin_width + word_pos.x - scroll.x;
-    let x = x.min(textarea.width - popup.width).max(0);
+    let x = x.min(textarea.width - 1 - popup.width).max(0);
 
     Point { x, y }
+}
+
+/// Whether the visual position `pos` is in view, i.e. neither scrolled out of the textarea,
+/// nor hidden behind the line number margin or the scrollbar. Arguments as for [`popup_position`].
+fn is_visible(textarea: Size, margin_width: CoordType, pos: Point, scroll: Point) -> bool {
+    let text_width = textarea.width - 1 - margin_width;
+    (0..text_width).contains(&(pos.x - scroll.x))
+        && (0..textarea.height).contains(&(pos.y - scroll.y))
 }
 
 #[cfg(test)]
@@ -275,14 +314,39 @@ mod tests {
 
     #[test]
     fn test_position_clamp_right() {
-        // Ends exactly at the right edge (columns 68-79).
-        assert_eq!(popup_position(TEXTAREA, 6, pt(62, 0), pt(0, 0), POPUP), pt(68, 1));
+        // Ends right before the scrollbar in column 79 (columns 67-78).
+        assert_eq!(popup_position(TEXTAREA, 6, pt(61, 0), pt(0, 0), POPUP), pt(67, 1));
+        // Would cover the scrollbar, so it moves left.
+        assert_eq!(popup_position(TEXTAREA, 6, pt(62, 0), pt(0, 0), POPUP), pt(67, 1));
         // Would stick out, so it moves left.
-        assert_eq!(popup_position(TEXTAREA, 6, pt(70, 0), pt(0, 0), POPUP), pt(68, 1));
+        assert_eq!(popup_position(TEXTAREA, 6, pt(70, 0), pt(0, 0), POPUP), pt(67, 1));
         // Scrolled horizontally, so it fits again.
         assert_eq!(popup_position(TEXTAREA, 6, pt(100, 0), pt(50, 0), POPUP), pt(56, 1));
         // Moved left and flipped above at the same time.
-        assert_eq!(popup_position(TEXTAREA, 6, pt(78, 19), pt(0, 0), POPUP), pt(68, 14));
+        assert_eq!(popup_position(TEXTAREA, 6, pt(78, 19), pt(0, 0), POPUP), pt(67, 14));
+    }
+
+    #[test]
+    fn test_is_visible() {
+        // 80 columns minus a 6 column margin and the scrollbar leave the text columns 0-72.
+        for (pos, scroll, visible) in [
+            (pt(0, 0), pt(0, 0), true),
+            (pt(72, 19), pt(0, 0), true),
+            // Behind the scrollbar or below the textarea.
+            (pt(73, 0), pt(0, 0), false),
+            (pt(0, 20), pt(0, 0), false),
+            // Scrolled out at the top, and at the left (behind the margin).
+            (pt(0, 4), pt(0, 5), false),
+            (pt(4, 0), pt(5, 0), false),
+            // Scrolled into view.
+            (pt(80, 30), pt(10, 25), true),
+            (pt(5, 5), pt(5, 5), true),
+        ] {
+            assert_eq!(is_visible(TEXTAREA, 6, pos, scroll), visible, "{pos:?} {scroll:?}");
+        }
+        // No textarea at all, e.g. in a tiny terminal.
+        assert!(!is_visible(Size::default(), 0, pt(0, 0), pt(0, 0)));
+        assert!(!is_visible(Size { width: 1, height: 1 }, 0, pt(0, 0), pt(0, 0)));
     }
 
     #[test]
@@ -422,6 +486,40 @@ mod tests {
             })));
         }
 
+        /// Turns the mouse wheel by `notches` (3 rows each) at `position`.
+        fn wheel(&mut self, position: Point, notches: CoordType) {
+            self.frame(Some(Input::Mouse(InputMouse {
+                state: InputMouseState::Scroll,
+                modifiers: kbmod::NONE,
+                position,
+                scroll: pt(0, notches),
+                drag: false,
+            })));
+        }
+
+        /// The screen position of the text at the visual position `pos`, while not scrolled.
+        fn screen_pos(&mut self, pos: Point) -> Point {
+            let textarea = self.outer("textarea");
+            let margin = self.buffer().borrow().margin_width();
+            pt(textarea.left + margin + pos.x, textarea.top + pos.y)
+        }
+
+        /// Right-clicks the text at the visual position `pos`, while not scrolled.
+        fn right_click(&mut self, pos: Point) {
+            let pos = self.screen_pos(pos);
+            self.mouse(InputMouseState::Right, pos);
+            self.mouse(InputMouseState::None, pos);
+        }
+
+        /// The misspelled word of the open popup, if any.
+        fn popup_word(&self) -> Option<String> {
+            Some(self.state.spell.popup.as_ref()?.word.as_ref()?.text.clone())
+        }
+
+        fn cursor(&self) -> Point {
+            self.buffer().borrow().cursor_logical_pos()
+        }
+
         fn buffer(&self) -> RcTextBuffer {
             self.state.documents.active().unwrap().buffer.clone()
         }
@@ -494,6 +592,7 @@ mod tests {
                 items: items.iter().map(|s| s.to_string()).collect(),
                 message,
                 focus: true,
+                textarea: None,
             });
             self.frame(None);
             assert!(self.is_open());
@@ -664,10 +763,10 @@ mod tests {
         h.frame(None);
         assert_eq!(h.outer("spell-suggestions"), at(left, textarea.top + row - hgt));
 
-        // Moved left at the right edge.
+        // Moved left at the right edge, so that it doesn't cover the scrollbar.
         h.state.spell.popup.as_mut().unwrap().word.as_mut().unwrap().visual_pos = pt(75, 0);
         h.frame(None);
-        assert_eq!(h.outer("spell-suggestions"), at(textarea.right - w, textarea.top + 1));
+        assert_eq!(h.outer("spell-suggestions"), at(textarea.right - 1 - w, textarea.top + 1));
 
         assert!(h.is_open());
     }
@@ -912,6 +1011,210 @@ mod tests {
         h.mouse(InputMouseState::Right, click(0));
         h.mouse(InputMouseState::None, click(0));
         assert_eq!(h.buffer().borrow().cursor_logical_pos(), pt(0, 0));
+        assert!(!h.is_open());
+
+        // On its last letter: Still the word.
+        h.right_click(pt(4, 0));
+        assert_eq!(h.popup_word().as_deref(), Some("teh"));
+        h.key(vk::ESCAPE);
+        assert!(!h.is_open());
+    }
+
+    #[test]
+    fn test_right_click_next_to_word() {
+        let _lock = enable_spellcheck();
+        let mut h = Harness::new("a teh x\nhello teh\n");
+
+        // The cell right after the misspelled word: Only moves the cursor,
+        // even though the cursor is now directly after the word.
+        h.right_click(pt(5, 0));
+        assert_eq!(h.cursor(), pt(5, 0));
+        assert!(!h.is_open());
+
+        // Past the end of a line that ends in a misspelled word: Same, at the end of the line.
+        h.right_click(pt(40, 1));
+        assert_eq!(h.cursor(), pt(9, 1));
+        assert!(!h.is_open());
+
+        // Whereas F7 accepts the word right before the cursor, e.g. right after typing it.
+        h.key(vk::F7);
+        assert_eq!(h.popup_word().as_deref(), Some("teh"));
+    }
+
+    // Right-clicks reach the textarea even while another control has the focus.
+    #[test]
+    fn test_right_click_while_popup_open() {
+        let _lock = enable_spellcheck();
+        let mut h = Harness::new("a teh x wrod y\n");
+
+        h.right_click(pt(3, 0));
+        assert_eq!(h.popup_word().as_deref(), Some("teh"));
+
+        // Another misspelled word: The popup switches to it.
+        h.right_click(pt(9, 0));
+        assert_eq!(h.popup_word().as_deref(), Some("wrod"));
+        assert_eq!(h.cursor(), pt(9, 0));
+        let popup = h.outer("spell-suggestions");
+        assert_eq!(pt(popup.left, popup.top), h.screen_pos(pt(8, 1)));
+
+        // A correct word: The popup closes, the cursor moves and the textarea has the focus.
+        // A drag with the right button held doesn't select anything.
+        let (x, end) = (h.screen_pos(pt(6, 0)), h.screen_pos(pt(12, 0)));
+        h.mouse(InputMouseState::Right, x);
+        h.mouse(InputMouseState::Right, end);
+        h.mouse(InputMouseState::None, end);
+        assert!(!h.is_open());
+        assert_eq!(h.cursor(), pt(6, 0));
+        assert!(!h.buffer().borrow().has_selection());
+        h.type_text("z");
+        assert_eq!(h.contents(), "a teh zx wrod y\n");
+    }
+
+    #[test]
+    fn test_right_click_while_find_focused() {
+        let _lock = enable_spellcheck();
+        let mut h = Harness::new("a teh x\n");
+        h.key(kbmod::CTRL | vk::F);
+        h.type_text("q");
+        assert_eq!(h.state.search_needle, "q");
+
+        h.right_click(pt(3, 0));
+        assert_eq!(h.cursor(), pt(3, 0));
+        assert_eq!(h.popup_word().as_deref(), Some("teh"));
+
+        // Escape closes the popup and the textarea keeps the focus: Typing goes there.
+        h.key(vk::ESCAPE);
+        assert!(!h.is_open());
+        h.type_text("z");
+        assert_eq!(h.contents(), "a tzeh x\n");
+        assert_eq!(h.state.search_needle, "q");
+    }
+
+    #[test]
+    fn test_right_click_with_modal_or_menu() {
+        let _lock = enable_spellcheck();
+
+        // A modal swallows the click: Nothing happens.
+        let mut h = Harness::new("a teh x\n");
+        h.state.wants_about = true;
+        h.frame(None);
+        let about = h.outer("about");
+        let click = h.screen_pos(pt(3, 0));
+        assert!(!about.contains(click));
+        h.right_click(pt(3, 0));
+        assert!(h.state.wants_about);
+        assert!(!h.is_open());
+        assert_eq!(h.cursor(), pt(0, 0));
+
+        // A menu closes, like on a left-click, and the click reaches the text.
+        let mut h = Harness::new(&format!("{}teh x\n", "a ".repeat(30)));
+        h.click_label("Edit");
+        assert!(h.layout_contains("\"  Select All\""));
+        let flyout = h.outer("flyout");
+        assert!(!flyout.contains(h.screen_pos(pt(61, 0))));
+        h.right_click(pt(61, 0));
+        assert!(!h.layout_contains("\"  Select All\""));
+        assert_eq!(h.cursor(), pt(61, 0));
+        assert_eq!(h.popup_word().as_deref(), Some("teh"));
+    }
+
+    // Word wrap may move the word elsewhere when the terminal is resized.
+    #[test]
+    fn test_popup_closes_on_resize() {
+        let _lock = enable_spellcheck();
+        let mut h = Harness::new(&format!("{}teh x\n", "aa ".repeat(23)));
+        h.buffer().borrow_mut().set_word_wrap(true);
+        h.buffer().borrow_mut().cursor_move_to_logical(pt(70, 0));
+        h.key(vk::F7);
+        assert_eq!(h.popup_word().as_deref(), Some("teh"));
+
+        // A resize event that doesn't change the size keeps it open.
+        h.frame(Some(Input::Resize(Size { width: 80, height: 24 })));
+        assert!(h.is_open());
+
+        // Narrower: "teh" is wrapped onto the next row, so the popup closes.
+        h.frame(Some(Input::Resize(Size { width: 60, height: 24 })));
+        assert!(!h.is_open());
+        h.type_text("z");
+        assert!(h.contents().ends_with("tzeh x\n"));
+
+        // Lower, without re-wrapping: Closes as well.
+        h.key(vk::F7);
+        assert!(h.is_open());
+        h.frame(Some(Input::Resize(Size { width: 60, height: 20 })));
+        assert!(!h.is_open());
+    }
+
+    // The popup follows the word while scrolling, but doesn't cover the menubar or statusbar.
+    #[test]
+    fn test_popup_closes_when_scrolled_out() {
+        let _lock = enable_spellcheck();
+        let mut h = Harness::new(&"teh x\n".repeat(100));
+        h.buffer().borrow_mut().cursor_move_to_logical(pt(1, 10));
+        h.key(vk::F7);
+        assert_eq!(h.popup_word().as_deref(), Some("teh"));
+        let textarea = h.outer("textarea");
+        let popup = h.outer("spell-suggestions");
+        assert_eq!(popup.top, textarea.top + 11);
+
+        // Away from the popup, which would swallow the wheel otherwise.
+        let wheel_at = pt(textarea.right - 10, textarea.top + 2);
+        h.wheel(wheel_at, 1);
+        assert!(h.is_open());
+        assert_eq!(h.outer("spell-suggestions").top, textarea.top + 8);
+
+        // Rows 10 -> 7 -> 4 -> 1 -> -2: Closes once the word is above the textarea.
+        h.wheel(wheel_at, 2);
+        assert!(h.is_open());
+        assert_eq!(h.outer("spell-suggestions").top, textarea.top + 2);
+        h.wheel(wheel_at, 1);
+        assert!(!h.is_open());
+
+        // The textarea still has the focus.
+        h.type_text("z");
+        assert_eq!(h.contents().lines().nth(10), Some("tzeh x"));
+
+        // F7 for a word that was scrolled out of view scrolls it back into view, and stays open.
+        h.buffer().borrow_mut().cursor_move_to_logical(pt(1, 20));
+        h.wheel(wheel_at, 10);
+        h.key(vk::F7);
+        assert_eq!(h.popup_word().as_deref(), Some("teh"));
+        assert_eq!(h.outer("spell-suggestions").top, textarea.top + 1);
+        h.key(vk::ESCAPE);
+
+        // On the last row it's above the word. Scrolling the word out at the bottom closes it too.
+        let last = textarea.height() - 1;
+        h.buffer().borrow_mut().cursor_move_to_logical(pt(1, 60));
+        h.key(vk::F7);
+        let popup = h.outer("spell-suggestions");
+        assert_eq!(popup.bottom, textarea.top + last);
+        h.wheel(wheel_at, -1);
+        assert!(!h.is_open());
+    }
+
+    // A word that's wrapped across two rows is still in view while its second row is.
+    #[test]
+    fn test_popup_wrapped_word_partly_scrolled_out() {
+        let _lock = enable_spellcheck();
+        let word = "tehteh".repeat(4);
+        let mut h = Harness::new(&format!("a\nb\n{word} x\n{}", "x\n".repeat(30)));
+        h.frame(Some(Input::Resize(Size { width: 20, height: 24 })));
+        h.buffer().borrow_mut().set_word_wrap(true);
+        h.buffer().borrow_mut().cursor_move_to_logical(pt(23, 2));
+        h.key(vk::F7);
+        assert_eq!(h.popup_word().as_deref(), Some(word.as_str()));
+        let start = h.state.spell.popup.as_ref().unwrap().word.as_ref().unwrap().visual_pos;
+        assert_eq!(start, pt(0, 2));
+        assert_eq!(h.buffer().borrow().cursor_visual_pos().y, 3);
+
+        // Scrolled by 3 rows: The word's first row is out of view, but the cursor's isn't.
+        let textarea = h.outer("textarea");
+        let wheel_at = pt(textarea.left + 5, textarea.bottom - 1);
+        h.wheel(wheel_at, 1);
+        assert!(h.is_open());
+        assert_eq!(h.outer("spell-suggestions").top, textarea.top);
+
+        h.wheel(wheel_at, 1);
         assert!(!h.is_open());
     }
 
