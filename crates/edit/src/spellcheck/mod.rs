@@ -143,9 +143,7 @@ pub fn suggest(dict: &Dictionary, word: &str) -> Vec<String> {
     // Measured on real misspellings (Wikipedia's list, Birkbeck, aspell), this beats spellbook's
     // order for capitalized common words and matches it for proper nouns.
     if is_capitalized(&word) {
-        let mut lower = Vec::new();
-        dict.suggest(&word.to_lowercase(), &mut lower);
-        let lower: Vec<String> = lower.iter().map(|s| capitalize(s)).collect();
+        let lower = suggest_lowercase(dict, &word, &suggestions);
         let first = suggestions
             .first()
             .filter(|s| keeps_first_place(dict, &word, s, lower.first()))
@@ -168,6 +166,24 @@ pub fn suggest(dict: &Dictionary, word: &str) -> Vec<String> {
     }
 
     suggestions
+}
+
+/// spellbook's suggestions for the lowercase form of the capitalized `word`, capitalized again.
+/// `native` is spellbook's list for `word` itself.
+///
+/// spellbook lists the edits of a word first ("teh" -> "the"), then its ngram suggestions,
+/// which scan the whole word list. That scan is the slow part, and for `native` spellbook already
+/// ran it on the lowercase word (unless the edits found good matches). Running it again would
+/// double the time the popup takes to open, so the edits of the lowercase word are followed by
+/// `native` instead. Without its splits, though, which mostly come from capitalized abbreviations
+/// ("Di sparingly" for "Disparingly"): If the lowercase word has no edits, the splits would come
+/// first, ahead of its ngram suggestions ("Disparagingly").
+fn suggest_lowercase(dict: &Dictionary, word: &str, native: &[String]) -> Vec<String> {
+    let mut edits = Vec::new();
+    dict.suggester().with_ngram_suggestions(false).suggest(&word.to_lowercase(), &mut edits);
+    let mut lower: Vec<String> = edits.iter().map(|s| capitalize(s)).collect();
+    lower.extend(native.iter().filter(|s| !s.contains([' ', '-'])).cloned());
+    lower
 }
 
 /// Whether the word starts with an uppercase letter and has no other uppercase letters ("Teh").
@@ -445,6 +461,44 @@ mod tests {
             native.truncate(MAX_SUGGESTIONS);
             assert_eq!(suggest(dict, word), native, "{word}");
         }
+    }
+
+    // Regression: The lowercase pass for capitalized words repeated spellbook's ngram scan
+    // over the whole word list, which doubled the time it takes to suggest something.
+    #[test]
+    fn test_suggest_lowercase_skips_ngrams() {
+        let dict = dictionary_blocking().unwrap();
+        let first = |word: &str| suggest(dict, word).into_iter().next();
+        let mut native = Vec::new();
+
+        // The edits of the lowercase word, capitalized.
+        dict.suggest("teh", &mut native);
+        let want: Vec<String> = native.iter().map(|s| capitalize(s)).collect();
+        assert_eq!(suggest_lowercase(dict, "Teh", &[]), want);
+
+        // Only the ngram scan finds "elephant". It's taken from spellbook's list for the word
+        // as typed, without the splits, instead of being run again.
+        dict.suggest("elephanttt", &mut native);
+        assert_eq!(native, ["elephant"]);
+        assert!(suggest_lowercase(dict, "Elephanttt", &[]).is_empty());
+        let fake: Vec<String> =
+            ["Elephant", "Ele phant", "Ele-phant", "Zebra"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(suggest_lowercase(dict, "Elephanttt", &fake), ["Elephant", "Zebra"]);
+        assert_eq!(first("Elephanttt").as_deref(), Some("Elephant"));
+
+        // spellbook lists the splits of the word as typed first ("Di sparingly"). They still don't
+        // beat the ngram suggestions when the lowercase word has no edits.
+        for (word, want) in [
+            ("Disparingly", "Disparagingly"),
+            ("Irregardless", "Regardless"),
+            ("Decidly", "Decidedly"),
+            ("Aspergerer", "Asperger"),
+        ] {
+            assert_eq!(first(word).as_deref(), Some(want), "{word}");
+        }
+        // The lowercase ranking keeps what edits of the word as typed find, too ("Canada").
+        let canadan = suggest(dict, "Canadan");
+        assert_eq!(canadan[..3], ["Canaan", "Canada", "Canadian"], "{canadan:?}");
     }
 
     #[test]
