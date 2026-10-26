@@ -36,6 +36,7 @@ const F7: &str = "\x1b[18~";
 const CTRL_T: &str = "\x14";
 const CTRL_S: &str = "\x13";
 const CTRL_Q: &str = "\x11";
+const CTRL_F: &str = "\x06";
 const ENTER: &str = "\r";
 const DOWN: &str = "\x1b[B";
 const RIGHT: &str = "\x1b[C";
@@ -225,6 +226,19 @@ impl Editor {
 
     fn left_click(&mut self, (x, y): (usize, usize)) {
         self.send(&format!("\x1b[<0;{};{}M\x1b[<0;{};{}m", x + 1, y + 1, x + 1, y + 1));
+    }
+
+    /// Resizes the terminal like a terminal emulator does: TIOCSWINSZ on the master side, which
+    /// signals the foreground process group. The explicit SIGWINCH covers kernels that don't.
+    /// [`Screen`] stays at `COLS` x `ROWS`, so only shrink it.
+    fn resize(&mut self, cols: u16, rows: u16) {
+        assert!(cols <= COLS && rows <= ROWS);
+        let size = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
+        let ret =
+            unsafe { libc::ioctl(self.pty.as_raw_fd(), libc::TIOCSWINSZ as _, &raw const size) };
+        assert_eq!(ret, 0, "TIOCSWINSZ: {}", io::Error::last_os_error());
+        let ret = unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGWINCH) };
+        assert_eq!(ret, 0, "kill: {}", io::Error::last_os_error());
     }
 
     fn lock(&self) -> MutexGuard<'_, Output> {
@@ -807,6 +821,95 @@ fn markdown_code_block() {
     for word in ["Notes", "prose", "mistake", "rust"] {
         assert_eq!(screen.underline_of(word), Some(Underline::None), "{word}\n{}", screen.dump());
     }
+}
+
+#[test]
+fn markdown_yaml_block_scalar_before_prose() {
+    let dir = TempDir::new();
+    // The highlighter loses track of the fences after the YAML block scalar (it runs into the
+    // closing fence). The checked lines must not depend on it.
+    let file = dir.write(
+        "notes.md",
+        "# Notes\n\
+         \n\
+         ```yaml\n\
+         jobs:\n\
+         \x20 build:\n\
+         \x20   steps:\n\
+         \x20     - run: |\n\
+         ```\n\
+         \n\
+         Prose after the fence with a recieve typo.\n\
+         \n\
+         ```rust\n\
+         let x = wierd(1);\n\
+         ```\n",
+    );
+    let editor = Editor::spawn(&dir, &[&file]);
+
+    let screen = editor.wait_screen("a curly underline on \"recieve\"", |s| s.is_curly("recieve"));
+    assert_curly(&editor, "recieve");
+    let (_, code_row) = screen.find("wierd").unwrap();
+    assert!(!screen.any_underline(code_row), "{}", screen.dump());
+    for word in ["jobs", "build", "steps", "run", "Prose", "typo"] {
+        assert_eq!(screen.underline_of(word), Some(Underline::None), "{word}\n{}", screen.dump());
+    }
+}
+
+#[test]
+fn windows_paths_and_accents() {
+    let dir = TempDir::new();
+    let file = dir.write(
+        "paths.txt",
+        "Path: C:\\Users\\Admin\\Documnets\\Reprots\n\
+         Also tools\\bild\\relese here.\n\
+         A na\u{00EF}ve caf\u{00E9} owner wrote teh menu.\n",
+    );
+    let editor = Editor::spawn(&dir, &[&file]);
+
+    let screen = editor.wait_screen("a curly underline on \"teh\"", |s| s.is_curly("teh"));
+    for word in ["Documnets", "Reprots", "bild", "relese", "na\u{00EF}ve", "caf\u{00E9}"] {
+        assert_eq!(screen.underline_of(word), Some(Underline::None), "{word}\n{}", screen.dump());
+    }
+}
+
+#[test]
+fn right_click_while_find_bar_open() {
+    let dir = TempDir::new();
+    let (mut editor, _, _) = open_typo(&dir);
+
+    // The Find bar opens above the text and moves it down.
+    editor.send(CTRL_F);
+    let screen = editor.wait_screen("the Find bar above the text", |s| {
+        s.find("Find").zip(s.find("Teh")).is_some_and(|(find, teh)| find.1 < teh.1)
+    });
+    let (x, y) = screen.find("Teh").unwrap();
+
+    // The right-click reaches the document, although the Find bar has the focus.
+    editor.right_click((x + 1, y));
+    let screen = editor.wait_screen("the popup with \"The\"", |s| {
+        s.popup().is_some_and(|p| p.items.iter().any(|i| i == "The"))
+    });
+    assert_eq!(screen.location(), Some((1, 2)), "{}", screen.dump());
+    let popup = screen.popup().unwrap();
+    assert_eq!((popup.left, popup.top), (x, y + 1), "{}", screen.dump());
+    assert!(screen.contains("Find:"), "{}", screen.dump());
+}
+
+#[test]
+fn popup_closes_on_resize() {
+    let dir = TempDir::new();
+    let (mut editor, _, _) = open_typo(&dir);
+
+    editor.send(F7);
+    editor.wait_screen("the popup with \"The\"", |s| {
+        s.popup().is_some_and(|p| p.items.iter().any(|i| i == "The"))
+    });
+
+    // Narrower, so that the full redraw at the new size covers every cell the popup was in.
+    editor.resize(COLS - 10, ROWS);
+    let screen = editor.wait_screen("the popup to close", |s| s.popup().is_none());
+    assert!(screen.is_curly("Teh"), "{}", screen.dump());
 }
 
 #[test]
