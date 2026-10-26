@@ -951,6 +951,56 @@ fn mispeled_fn(speling: u32) {
         assert_eq!(collect(&mut tb), ["coment", "wierd"]);
     }
 
+    /// Scope, highlighter and tokenizer together: `for_each_segment()` picks the `TextKind`,
+    /// and the tokenizer reads `\`, `%` and `\'` by it. String literals in code are read as code
+    /// (escapes and printf specs separate words), and everything else is read as prose
+    /// (a run with `\` + letter is a path and is skipped).
+    #[test]
+    fn test_collect_text_kinds() {
+        let _g = shared_globals();
+
+        // Each of these lines gives a different result if the kinds are swapped.
+        let doc = r#"let a = "\nteh line";
+let b = "Error:\nPlese try again";
+let c = "it isn\'t wierd";
+let d = "%lu items, %zu bytes, %02X and \u{feff}\xde\xad wrod";
+// see C:\Program Files\Microsoft Office\root and tools\bild\relese
+// a coment with teh typo
+"#;
+        let mut tb = buffer(Some("rust"), doc);
+        assert_eq!(collect(&mut tb), ["teh", "Plese", "wierd", "wrod", "coment", "teh"]);
+
+        let mut tb = buffer(Some("c"), "printf(\"%lu itmes\\n\", n); // in tools\\bild\\relese\n");
+        assert_eq!(collect(&mut tb), ["itmes"]);
+
+        let doc = r"x = 'it\'s teh %s'  # see C:\Users\Admin\Documnets
+";
+        let mut tb = buffer(Some("python"), doc);
+        assert_eq!(collect(&mut tb), ["teh"]);
+
+        // Data formats check comments only, as prose.
+        let doc = r#"{"path": "C:\\Program Files\\Microsft\\teh"} // see C:\Program Files\Microsft Ofice\root, a coment
+"#;
+        let mut tb = buffer(Some("json"), doc);
+        assert_eq!(collect(&mut tb), ["coment"]);
+
+        // Markdown is prose: paths are skipped, escaped punctuation isn't a path,
+        // and accented spellings of dictionary words are correct.
+        let doc = r"See tools\bild\relese and C:\Program Files\Microsft Office\root for teh files.
+Escapes like \*wrod\* still work, and a naïve café résumé is fine.
+In `code` and [link tetx](https://example.com/speling) too.
+";
+        let mut tb = buffer(Some("markdown"), doc);
+        assert_eq!(collect(&mut tb), ["teh", "wrod", "tetx"]);
+
+        // So are plain text and commit messages.
+        let doc = "Output goes to tools\\bild\\relese, see teh log.\n";
+        let mut tb = buffer(None, doc);
+        assert_eq!(collect(&mut tb), ["teh"]);
+        let mut tb = buffer(Some("git-commit"), doc);
+        assert_eq!(collect(&mut tb), ["teh"]);
+    }
+
     #[test]
     fn test_collect_long_line() {
         let _g = shared_globals();
