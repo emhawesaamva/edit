@@ -6,6 +6,7 @@
 //! Upstream's `TextBuffer::find_and_replace_all()` resumed the search at the end of the text,
 //! and ICU then searched again from the start. So if the replacement matched again
 //! (same text, another case, or containing the pattern), it never returned.
+//! Reported upstream as microsoft/edit#994.
 //! Each test runs on a helper thread with a timeout, so that a regression fails instead of hanging.
 
 use std::sync::mpsc::{self, RecvTimeoutError};
