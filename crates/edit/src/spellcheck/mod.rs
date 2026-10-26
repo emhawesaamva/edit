@@ -243,7 +243,42 @@ fn interleave(preferred: &[String], all: &[String]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::process::Command;
+    use std::time::Duration;
+
     use super::*;
+
+    // The dictionary must not be loaded while spell checking is off.
+    // The switches and the dictionary are process-wide, and other tests load it,
+    // so this test runs itself again in a child process, without the other tests.
+    #[test]
+    fn test_disabled_never_loads() {
+        const NAME: &str = "spellcheck::tests::test_disabled_never_loads";
+        const CHILD: &str = "EDIT_TEST_SPELLCHECK_CHILD";
+
+        if std::env::var_os(CHILD).is_some() {
+            configure(false, true);
+            set_enabled(false);
+            assert!(!is_enabled());
+            assert_eq!(dictionary_status(), DictionaryStatus::NotStarted);
+            assert_eq!(poll_timeout(), Duration::MAX);
+
+            set_enabled(true);
+            assert_ne!(dictionary_status(), DictionaryStatus::NotStarted);
+            assert!(poll_timeout() < Duration::MAX);
+            return;
+        }
+
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--test-threads=1"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // "1 passed" makes sure that the child found this test.
+        assert!(output.status.success() && stdout.contains(" 1 passed"), "{stdout}\n{stderr}");
+    }
 
     #[test]
     fn test_is_word_correct() {
