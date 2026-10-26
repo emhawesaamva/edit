@@ -1242,10 +1242,9 @@ SELECT 'Domain\UserNmae teh' AS login;
         assert_eq!(collect(&mut tb), ["teh", "coment", "coment"]);
     }
 
-    /// The rest of [`TextKind::VerbatimString`](tokenizer::TextKind::VerbatimString), which the
-    /// tokenizer reads as prose until fix-r2-tokenizer lands. Re-enable this test along with it.
+    /// The rest of [`TextKind::VerbatimString`](tokenizer::TextKind::VerbatimString): PowerShell
+    /// escapes, doubled apostrophes, variables, T-SQL's `N'...'` and printf specs.
     #[test]
-    #[ignore = "needs fix-r2-tokenizer"]
     fn test_collect_verbatim_strings() {
         let _g = shared_globals();
 
@@ -1266,6 +1265,34 @@ RAISERROR('Found %ld itmes', 16, 1);
 ";
         let mut tb = buffer(Some("sql"), doc);
         assert_eq!(collect(&mut tb), ["wierd", "itmes"]);
+    }
+
+    /// One line per case, through scope, highlighter and tokenizer.
+    #[test]
+    fn test_collect_cross_part() {
+        let _g = shared_globals();
+        let cases: &[(&str, &str, &[&str])] = &[
+            ("powershell", r#"$p = "C:\Program Files\Microsoft Office\root""#, &[]),
+            ("powershell", r"$k = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run'", &[]),
+            ("powershell", r#"Write-Host "Line1`nThe quick fox jumpd""#, &["jumpd"]),
+            ("powershell", r#"Write-Host "Done.`nplease restart""#, &[]),
+            ("powershell", r#"Write-Host "Running on $env:COMPUTERNAME""#, &[]),
+            ("sql", "SELECT N'Hello world', 'isn''t';", &[]),
+            ("sql", "RAISERROR('%ld itmes', 16, 1);", &["itmes"]),
+            ("rust", r#"let s = "\nhello teh";"#, &["teh"]),
+            ("xml", "<!-- a coment -->", &["coment"]),
+            // MySQL's quoted identifiers are names.
+            ("sql", "SELECT `Customers`, `Orders` FROM `Sales`;", &[]),
+            // A MySQL escape reads like a path in a verbatim string, so the run is skipped.
+            ("sql", "SELECT 'Helo\\nWrold';", &[]),
+            // Commit subjects and exec lines are comments, read as prose.
+            ("git-rebase", "pick 1a2b3c4 Fix teh widget", &["teh"]),
+            ("git-rebase", "exec cargo tset --relese", &["tset", "relese"]),
+        ];
+        for &(language, line, expected) in cases {
+            let mut tb = buffer(Some(language), &format!("{line}\n"));
+            assert_eq!(collect(&mut tb), expected, "{language}: {line}");
+        }
     }
 
     #[test]
