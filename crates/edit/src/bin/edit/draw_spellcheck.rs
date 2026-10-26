@@ -35,6 +35,8 @@ pub struct SpellPopup {
     pub items: Vec<String>,
     /// Shown as the only item instead of `items`, e.g. if there's nothing to suggest.
     pub message: Option<LocId>,
+    /// The cursor offset when the popup opened.
+    cursor: usize,
     /// Whether the list still needs to take the focus. True until the first draw.
     focus: bool,
     /// The size of the textarea during the first draw, i.e. when the popup opened.
@@ -131,7 +133,8 @@ fn spell_popup_new(
         SpellAt::Loading => (None, Vec::new(), Some(LocId::SpellLoading)),
         SpellAt::Unavailable => (None, Vec::new(), Some(LocId::SpellUnavailable)),
     };
-    Some(SpellPopup { buffer, word, items, message, focus: true, textarea: None })
+    let cursor = buffer.borrow().cursor_offset();
+    Some(SpellPopup { buffer, word, items, message, cursor, focus: true, textarea: None })
 }
 
 fn draw_spell_popup(ctx: &mut Context, state: &mut State, textarea: Size, scroll: Point) {
@@ -164,9 +167,12 @@ fn draw_spell_popup(ctx: &mut Context, state: &mut State, textarea: Size, scroll
         // The popup closes once the cursor leaves the word (e.g. F3 moved it to the next match),
         // so that typing and Enter don't go to a word elsewhere, maybe out of view.
         // F7 and right-clicks open it with the cursor in or right after the word.
+        // A message has no word, so it closes once the cursor moves at all.
         let offset = tb.cursor_offset();
-        let on_word =
-            popup.word.as_ref().is_none_or(|w| w.range.start <= offset && offset <= w.range.end);
+        let on_word = match &popup.word {
+            Some(w) => w.range.start <= offset && offset <= w.range.end,
+            None => offset == popup.cursor,
+        };
         // Once the word was scrolled out of view (e.g. with the mouse wheel), the popup closes
         // instead of covering the menubar or statusbar. The cursor's row counts, too, because
         // the cursor is in or right after the word (see above), which may be wrapped.
@@ -598,6 +604,7 @@ mod tests {
                 word,
                 items: items.iter().map(|s| s.to_string()).collect(),
                 message,
+                cursor: self.buffer().borrow().cursor_offset(),
                 focus: true,
                 textarea: None,
             });
@@ -1258,6 +1265,20 @@ mod tests {
         // Enter replaces the selected match with a newline, and leaves the misspelled word alone.
         h.key(vk::RETURN);
         assert_eq!(h.contents(), "a teh x\nb\nc \n d\n");
+
+        // A message has no word to leave, but it closes too, instead of following the cursor.
+        let mut h = Harness::new("a the x\nb\nc needle d\n");
+        h.buffer().borrow_mut().cursor_move_to_logical(pt(3, 0));
+        h.key(vk::F7);
+        assert!(message(&h) == Some(LocId::SpellNoMisspelling));
+        h.frame(None);
+        assert!(h.is_open());
+        h.state.search_needle = "needle".to_string();
+        h.key(vk::F3);
+        assert_eq!(h.cursor(), pt(8, 2));
+        assert!(!h.is_open());
+        h.type_text("z");
+        assert_eq!(h.contents(), "a the x\nb\nc z d\n");
     }
 
     #[test]
