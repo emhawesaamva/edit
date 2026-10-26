@@ -100,14 +100,28 @@ pub fn suggest(dict: &Dictionary, word: &str) -> Vec<String> {
     let mut suggestions = Vec::new();
     dict.suggest(&word, &mut suggestions);
 
-    // For a capitalized word like "Teh", spellbook first suggests for "Teh" ("Eh", "Th", ...)
-    // and appends the suggestions for "teh" ("The", ...) after them, so the truncation below
-    // would drop the latter. Interleave the two, so that the best of each come first.
+    // For a capitalized word like "Teh", spellbook first lists its suggestions for "Teh" as typed
+    // and then those for "teh". The former are mostly edits of the capital letter ("Eh"),
+    // splits after capitalized abbreviations ("Ac cussed" for "Accussed") and proper nouns.
+    // The latter are spellbook's own ranking for the common word ("The").
+    // So alternate between the two, starting with the lowercase ranking, but keep spellbook's
+    // first choice first if it's a proper noun ("Amercia" -> "America"; see `keeps_first_place`).
+    // Measured on real misspellings (Wikipedia's list, Birkbeck, aspell), this beats spellbook's
+    // order for capitalized common words and matches it for proper nouns.
     if is_capitalized(&word) {
         let mut lower = Vec::new();
         dict.suggest(&word.to_lowercase(), &mut lower);
         let lower: Vec<String> = lower.iter().map(|s| capitalize(s)).collect();
-        suggestions = interleave(&suggestions, &lower);
+        let first = suggestions
+            .first()
+            .filter(|s| keeps_first_place(dict, &word, s, lower.first()))
+            .cloned();
+        suggestions = interleave(&lower, &suggestions);
+        if let Some(first) = first
+            && let Some(i) = suggestions.iter().position(|s| *s == first)
+        {
+            suggestions[..=i].rotate_right(1);
+        }
     }
 
     suggestions.truncate(MAX_SUGGESTIONS);
@@ -137,12 +151,46 @@ fn capitalize(word: &str) -> String {
     }
 }
 
-/// Alternates between `all` and `preferred`, skipping duplicates. Only items in `all` are returned,
-/// so this merely reorders `all`, such that the first items of `preferred` move up.
-fn interleave(all: &[String], preferred: &[String]) -> Vec<String> {
+/// Whether spellbook's `first` suggestion for the capitalized `word` stays first:
+/// * it's a proper noun ("America": the dictionary doesn't know "america"),
+/// * it starts with the same letter as `word`,
+/// * and the best suggestion for the lowercase word isn't simply two swapped letters,
+///   unless `first` is too ("Htis" -> "This", not "Hts"; but "Amercia" -> "America").
+fn keeps_first_place(
+    dict: &Dictionary,
+    word: &str,
+    first: &str,
+    lower_first: Option<&String>,
+) -> bool {
+    !first.contains([' ', '-'])
+        && word.chars().next() == first.chars().next()
+        && !dict.check(&first.to_lowercase())
+        && !lower_first.is_some_and(|l| {
+            l != first && is_adjacent_swap(word, l) && !is_adjacent_swap(word, first)
+        })
+}
+
+/// Whether `b` is `a` with two adjacent letters swapped ("Teh" -> "The"). Ignores case.
+fn is_adjacent_swap(a: &str, b: &str) -> bool {
+    let a: Vec<char> = a.chars().flat_map(char::to_lowercase).collect();
+    let b: Vec<char> = b.chars().flat_map(char::to_lowercase).collect();
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = (0..a.len()).filter(|&i| a[i] != b[i]);
+    match (diff.next(), diff.next(), diff.next()) {
+        (Some(i), Some(j), None) => j == i + 1 && a[i] == b[j] && a[j] == b[i],
+        _ => false,
+    }
+}
+
+/// Alternates between `preferred` and `all`, starting with `preferred`, skipping duplicates.
+/// Only items in `all` are returned, so this merely reorders `all`, such that the first items
+/// of `preferred` move up.
+fn interleave(preferred: &[String], all: &[String]) -> Vec<String> {
     let mut res: Vec<String> = Vec::with_capacity(all.len());
-    let mut a = all.iter();
-    let mut b = preferred.iter().filter(|s| all.contains(s));
+    let mut a = preferred.iter().filter(|s| all.contains(s));
+    let mut b = all.iter();
 
     loop {
         let (x, y) = (a.next(), b.next());
@@ -204,23 +252,53 @@ mod tests {
 
         let teh = suggest(dict, "Teh");
         assert!(teh.len() <= MAX_SUGGESTIONS, "{teh:?}");
-        assert!(teh.iter().take(2).any(|s| s == "The"), "{teh:?}");
         assert!(teh.iter().all(|s| s.starts_with(char::is_uppercase)), "{teh:?}");
         let dont = suggest(dict, "Dont");
         assert!(dont.iter().any(|s| s == "Don't"), "{dont:?}");
         let dont = suggest(dict, "Dont\u{2019}");
         assert!(dont.iter().all(|s| !s.contains('\'')), "{dont:?}");
 
-        // spellbook's first choice stays first, e.g. for proper nouns.
-        let mut first = Vec::new();
-        for word in ["Teh", "Amercia", "Germnay", "Pariss", "Thier"] {
-            dict.suggest(word, &mut first);
-            assert_eq!(suggest(dict, word).first(), first.first(), "{word}");
+        // Regression: spellbook's first choice for the word as typed came first, so a
+        // sentence-initial "Teh" offered "Eh" (and "Accross" "Ac cross") before the common word.
+        // Its ranking for the lowercase word comes first now...
+        let first = |word: &str| suggest(dict, word).into_iter().next();
+        for (word, want) in [
+            ("Teh", "The"),
+            ("Thier", "Their"),
+            ("Accross", "Across"),
+            ("Aquired", "Acquired"),
+            ("Agian", "Again"),
+            // A proper noun doesn't beat two swapped letters ("Hts", "Verizon").
+            ("Htis", "This"),
+            ("Verison", "Version"),
+        ] {
+            assert_eq!(first(word).as_deref(), Some(want), "{word}");
         }
-        assert_eq!(suggest(dict, "Amercia").first().map(String::as_str), Some("America"));
+        // ...except that a proper noun spellbook ranks first stays first.
+        for (word, want) in [
+            ("Amercia", "America"),
+            ("Febuary", "February"),
+            ("Guiness", "Guinness"),
+            ("Lybia", "Libya"),
+            ("Pariss", "Paris"),
+        ] {
+            assert_eq!(first(word).as_deref(), Some(want), "{word}");
+        }
 
-        // Lowercase words are unaffected.
-        assert_eq!(suggest(dict, "teh").first().map(String::as_str), Some("the"));
+        // This only reorders spellbook's suggestions.
+        let mut native = Vec::new();
+        for word in ["Teh", "Accussed", "Amercia", "Thier"] {
+            dict.suggest(word, &mut native);
+            let ours = suggest(dict, word);
+            assert!(ours.iter().all(|s| native.contains(s)), "{word}: {ours:?} vs {native:?}");
+        }
+
+        // Lowercase words keep spellbook's order.
+        for word in ["teh", "thier", "agian", "amercia"] {
+            dict.suggest(word, &mut native);
+            native.truncate(MAX_SUGGESTIONS);
+            assert_eq!(suggest(dict, word), native, "{word}");
+        }
     }
 
     #[test]
@@ -229,16 +307,34 @@ mod tests {
         let all = v(&["Eh", "Th", "Te", "Tet", "The", "Tech"]);
 
         assert_eq!(
-            interleave(&all, &v(&["The", "Eh", "Tech"])),
-            v(&["Eh", "The", "Th", "Te", "Tech", "Tet"])
+            interleave(&v(&["The", "Eh", "Tech"]), &all),
+            v(&["The", "Eh", "Th", "Tech", "Te", "Tet"])
         );
         // Items that aren't in `all` are dropped, and duplicates are skipped.
         assert_eq!(
-            interleave(&all, &v(&["Zzz", "The", "The", "Eh"])),
-            v(&["Eh", "The", "Th", "Te", "Tet", "Tech"])
+            interleave(&v(&["Zzz", "The", "The", "Eh"]), &all),
+            v(&["The", "Eh", "Th", "Te", "Tet", "Tech"])
         );
-        assert_eq!(interleave(&all, &[]), all);
-        assert_eq!(interleave(&[], &v(&["The"])), Vec::<String>::new());
+        assert_eq!(interleave(&[], &all), all);
+        assert_eq!(interleave(&v(&["The"]), &[]), Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_is_adjacent_swap() {
+        for (a, b) in [("Teh", "The"), ("Ehllo", "Hello"), ("Htis", "This"), ("ab", "BA")] {
+            assert!(is_adjacent_swap(a, b), "{a} {b}");
+        }
+        for (a, b) in [
+            ("Teh", "Teh"),
+            ("Teh", "Tea"),
+            ("Lybia", "Libya"),
+            ("Teh", "Thee"),
+            ("abc", "cba"),
+            ("abcd", "badc"),
+            ("", ""),
+        ] {
+            assert!(!is_adjacent_swap(a, b), "{a} {b}");
+        }
     }
 
     #[test]
