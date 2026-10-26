@@ -23,6 +23,8 @@ single-threaded = []
 
 [dependencies]
 lsh = { path = "../lsh", version = "0.1", default-features = false, features = ["compiler", "glob"] }
+# Fork: spellcheck. Hunspell-compatible spell checker (MPL-2.0).
+spellbook = "0.4.2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

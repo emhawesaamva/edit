@@ -29,6 +29,7 @@ pub mod maybe_owned;
 pub mod oklab;
 pub mod path;
 pub mod simd;
+pub mod spellcheck; // Fork: spellcheck
 pub mod sys;
 pub mod tui;
 pub mod unicode;

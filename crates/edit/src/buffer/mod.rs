@@ -22,6 +22,7 @@
 
 mod gap_buffer;
 mod navigation;
+mod spelling; // Fork: spellcheck
 
 use std::borrow::Cow;
 use std::cell::UnsafeCell;
@@ -33,6 +34,7 @@ use std::rc::Rc;
 use std::str;
 
 pub use gap_buffer::GapBuffer;
+pub use spelling::{SpellAt, SpellWord}; // Fork: spellcheck
 
 use crate::arena::{Arena, arena_write_fmt, scratch_arena};
 use crate::cell::SemiRefCell;
@@ -310,6 +312,9 @@ pub struct TextBuffer {
     overtype: bool,
 
     wants_cursor_visibility: bool,
+
+    // Fork: spellcheck
+    spell: spelling::SpellState,
 }
 
 impl TextBuffer {
@@ -361,6 +366,8 @@ impl TextBuffer {
             overtype: false,
 
             wants_cursor_visibility: false,
+
+            spell: Default::default(), // Fork: spellcheck
         })
     }
 
@@ -2068,6 +2075,14 @@ impl TextBuffer {
         let logical_y_beg = self.cursor_for_rendering.unwrap().logical_pos.y;
         let logical_y_end = cursor.logical_pos.y + 1;
         self.render_apply_highlights(origin, destination, logical_y_beg..logical_y_end, fb);
+        // Fork: spellcheck
+        self.render_apply_spellcheck(
+            origin,
+            destination,
+            logical_y_beg..logical_y_end,
+            focused,
+            fb,
+        );
 
         // Colorize the margin that we wrote above.
         if self.margin_width > 0 {

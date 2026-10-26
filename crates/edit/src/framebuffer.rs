@@ -907,7 +907,9 @@ impl Attributes {
     pub const Italic: Self = Self(2);
     pub const Underlined: Self = Self(4);
     pub const Strikethrough: Self = Self(8);
-    pub const All: Self = Self(16 - 1);
+    // Fork: spellcheck. Curly underline (SGR 4:3) with a colored underline (SGR 58).
+    pub const Undercurl: Self = Self(16);
+    pub const All: Self = Self(32 - 1);
 
     pub const fn is(self, attr: Self) -> bool {
         (self.0 & attr.0) == attr.0

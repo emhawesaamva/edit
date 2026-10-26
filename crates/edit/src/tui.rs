@@ -2117,6 +2117,20 @@ impl<'a> Context<'a, '_> {
         self.textarea_internal(classname, TextBufferPayload::Editline(text))
     }
 
+    /// Fork: spellcheck. Scroll offset of the most recently created node, if it is a textarea.
+    /// Needed to position popups relative to the text cursor.
+    pub fn textarea_scroll_offset(&self) -> Option<Point> {
+        // SKELETON: placeholder.
+        None
+    }
+
+    /// Fork: spellcheck. Whether the most recently created node is a textarea that was
+    /// right-clicked this frame. The click has already moved the text cursor to the click position.
+    pub fn textarea_right_clicked(&self) -> bool {
+        // SKELETON: placeholder.
+        false
+    }
+
     /// Creates a text area.
     pub fn textarea(&mut self, classname: &'static str, tb: RcTextBuffer) {
         self.textarea_internal(classname, TextBufferPayload::Textarea(tb));

@@ -52,6 +52,12 @@ impl<'doc> Highlighter<'doc> {
         self.logical_pos_y
     }
 
+    /// See [`Runtime::is_idle`].
+    // Fork: spellcheck
+    pub fn is_idle(&self) -> bool {
+        self.runtime.is_idle()
+    }
+
     /// Create a restorable snapshot of the current highlighter state
     /// so we can resume highlighting from this point later.
     pub fn snapshot(&self) -> HighlighterState {

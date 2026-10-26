@@ -105,6 +105,13 @@ impl<'pa, 'ps, 'pc> Runtime<'pa, 'ps, 'pc> {
         }
     }
 
+    /// Whether the next line starts fresh at the entrypoint, i.e. no multi-line construct
+    /// (block comment, fenced code block, etc.) is pending from previous lines.
+    // Fork: spellcheck
+    pub fn is_idle(&self) -> bool {
+        self.stack.is_empty() && self.registers.pc == self.entrypoint
+    }
+
     pub fn snapshot(&self) -> RuntimeState {
         RuntimeState { stack: self.stack.clone(), registers: self.registers }
     }
