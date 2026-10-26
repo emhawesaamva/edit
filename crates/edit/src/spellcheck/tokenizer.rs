@@ -45,10 +45,16 @@ pub enum TextKind {
     /// A string literal in code: `\n`, `\x41`, `\u{...}`, `\'` are escape sequences
     /// and `%lu` is a printf spec.
     CodeString,
+    /// A string literal in a language whose strings don't use `\` escapes (PowerShell, SQL):
+    /// `\` is part of a path like in prose, but `%ld` is still a printf spec, `''` is an escaped
+    /// apostrophe, `` `n `` is a PowerShell escape and `N'...'` is a T-SQL Unicode string.
+    VerbatimString,
 }
 
 /// Calls `f` with the byte range of every candidate word in `text`, reading it as `kind`.
 pub fn for_each_word_in(text: &[u8], kind: TextKind, mut f: impl FnMut(Range<usize>)) {
+    // SKELETON (round 2 fixes): read as prose until the tokenizer part implements it.
+    let kind = if kind == TextKind::VerbatimString { TextKind::Prose } else { kind };
     let len = text.len();
     // Start of the current run.
     let mut run_beg = 0;
