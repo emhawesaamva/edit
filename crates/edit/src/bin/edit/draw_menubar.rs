@@ -118,6 +118,12 @@ fn draw_menu_edit(ctx: &mut Context, state: &mut State) {
         tb.select_all();
         ctx.needs_rerender();
     }
+    // Fork: spellcheck. Only sets a flag, because `tb` is still borrowed here.
+    if edit::spellcheck::is_enabled()
+        && ctx.menubar_menu_button(loc(LocId::EditSpellingSuggestions), 'S', kbmod::CTRL | vk::T)
+    {
+        state.spell.request = true;
+    }
     ctx.menubar_menu_end();
 }
 
@@ -140,6 +146,13 @@ fn draw_menu_view(ctx: &mut Context, state: &mut State) {
             tb.set_word_wrap(!word_wrap);
             ctx.needs_rerender();
         }
+    }
+
+    // Fork: spellcheck
+    let spellcheck = edit::spellcheck::is_enabled();
+    if ctx.menubar_menu_checkbox(loc(LocId::ViewSpellCheck), 'C', vk::NULL, spellcheck) {
+        edit::spellcheck::set_enabled(!spellcheck);
+        ctx.needs_rerender();
     }
 
     ctx.menubar_menu_end();
