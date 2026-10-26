@@ -527,9 +527,71 @@ mod tests {
             self.tui.debug_layout(&scratch).contains(text)
         }
 
+        /// Renders the UI like the main loop does and returns the screen cells with a curly underline.
+        /// Only complete if nothing was rendered before, because the output only contains changed rows.
+        fn curly_cells(&mut self) -> Vec<Point> {
+            let scratch = scratch_arena(None);
+            let output = self.tui.render(&scratch);
+            let mut cells = Vec::new();
+            let mut curly = false;
+            let mut pos = pt(0, 0);
+            let mut rest = output.as_str();
+
+            while let Some(c) = rest.chars().next() {
+                if c != '\x1b' {
+                    let width = label_width(c.encode_utf8(&mut [0; 4]));
+                    if curly {
+                        cells.extend((0..width).map(|i| pt(pos.x + i, pos.y)));
+                    }
+                    pos.x += width;
+                    rest = &rest[c.len_utf8()..];
+                    continue;
+                }
+
+                let body = rest.strip_prefix("\x1b[").expect("only CSI sequences are expected");
+                let end = body.find(|c: char| ('\x40'..='\x7e').contains(&c)).unwrap();
+                let params = &body[..end];
+                match &body[end..end + 1] {
+                    "H" => {
+                        let (row, column) = params.split_once(';').unwrap();
+                        pos = pt(
+                            column.parse::<CoordType>().unwrap() - 1,
+                            row.parse::<CoordType>().unwrap() - 1,
+                        );
+                    }
+                    "m" => {
+                        let mut params = params.split(';');
+                        while let Some(param) = params.next() {
+                            match param {
+                                "" | "0" | "4" | "24" | "4:0" | "4:1" => curly = false,
+                                "4:3" => curly = true,
+                                // `38;2;r;g;b` or `38;5;n`.
+                                "38" | "48" => {
+                                    let n = if params.next() == Some("2") { 3 } else { 1 };
+                                    params.nth(n - 1);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                rest = &body[end + 1..];
+            }
+
+            cells
+        }
+
         /// Left-clicks the label with exactly the given text.
         fn click_label(&mut self, text: &str) {
-            let pos = {
+            let pos = self.label_pos(text);
+            self.mouse(InputMouseState::Left, pos);
+            self.mouse(InputMouseState::None, pos);
+        }
+
+        /// The top-left corner of the label with exactly the given text.
+        fn label_pos(&mut self, text: &str) -> Point {
+            {
                 let scratch = scratch_arena(None);
                 let layout = self.tui.debug_layout(&scratch);
                 let needle = format!("text:         \"{text}\"");
@@ -551,9 +613,7 @@ mod tests {
                     .map(|s| s.parse().unwrap())
                     .collect();
                 pt(v[0], v[1])
-            };
-            self.mouse(InputMouseState::Left, pos);
-            self.mouse(InputMouseState::None, pos);
+            }
         }
     }
 
@@ -731,6 +791,8 @@ mod tests {
             assert_eq!(h.contents(), format!("a {} x\n", items[0]));
             h.key(kbmod::CTRL | vk::Z);
             assert_eq!(h.contents(), "a teh x\n");
+            h.key(kbmod::CTRL | vk::Y);
+            assert_eq!(h.contents(), format!("a {} x\n", items[0]));
 
             // On a correct word: A message instead of suggestions.
             let mut h = Harness::new("a teh x\n");
@@ -851,5 +913,114 @@ mod tests {
         h.mouse(InputMouseState::None, click(0));
         assert_eq!(h.buffer().borrow().cursor_logical_pos(), pt(0, 0));
         assert!(!h.is_open());
+    }
+
+    #[test]
+    fn test_popup_double_click_activates() {
+        let mut h = Harness::new("teh x\n");
+        h.open_teh(&["zebrafish", "quokka"]);
+        let pos = h.label_pos("  quokka");
+
+        // The first click only selects the item.
+        h.mouse(InputMouseState::Left, pos);
+        h.mouse(InputMouseState::None, pos);
+        assert!(h.is_open());
+        assert!(h.layout_contains("\"> quokka\""));
+        assert_eq!(h.contents(), "teh x\n");
+
+        // The second one replaces the word with it.
+        h.mouse(InputMouseState::Left, pos);
+        h.mouse(InputMouseState::None, pos);
+        assert!(!h.is_open());
+        assert_eq!(h.contents(), "quokka x\n");
+    }
+
+    #[test]
+    fn test_shortcuts_ignored_while_disabled_globally() {
+        let _lock = enable_spellcheck();
+        spellcheck::set_enabled(false);
+
+        let mut h = Harness::new("a teh x\n");
+        h.buffer().borrow_mut().cursor_move_to_logical(pt(3, 0));
+        h.key(vk::F7);
+        let f7 = h.is_open();
+        h.key(kbmod::CTRL | vk::T);
+        let ctrl_t = h.is_open();
+        h.state.spell.request = true;
+        h.frame(None);
+        let request = h.is_open();
+
+        let textarea = h.outer("textarea");
+        let margin = h.buffer().borrow().margin_width();
+        let click = pt(textarea.left + margin + 4, textarea.top);
+        h.mouse(InputMouseState::Right, click);
+        h.mouse(InputMouseState::None, click);
+        let right_click = h.is_open();
+        let cursor = h.buffer().borrow().cursor_logical_pos();
+        let runs = h.curly_runs();
+
+        spellcheck::set_enabled(true);
+        assert!(!f7 && !ctrl_t && !request && !right_click);
+        assert!(!h.state.spell.request);
+        // The right-click still moves the cursor, like with spell checking enabled.
+        assert_eq!(cursor, pt(4, 0));
+        assert!(runs.is_empty(), "{runs:?}");
+    }
+
+    // The Find and Go to Line boxes are editlines, which never get spell checked.
+    #[test]
+    fn test_editlines_never_underline() {
+        let _lock = enable_spellcheck();
+
+        let mut h = Harness::new("teh x\n");
+        h.key(kbmod::CTRL | vk::F);
+        h.type_text("wrod speling ");
+        assert_eq!(h.state.search_needle, "wrod speling ");
+        assert_eq!(h.curly_runs(), ["teh"]);
+
+        let mut h = Harness::new("teh x\n");
+        h.key(kbmod::CTRL | vk::G);
+        h.type_text("wrod speling ");
+        assert_eq!(h.state.goto_target, "wrod speling ");
+        assert_eq!(h.curly_runs(), ["teh"]);
+    }
+
+    // Menus, dialogs and the popup itself clear the underline of the text below them.
+    #[test]
+    fn test_no_underline_under_floats() {
+        let _lock = enable_spellcheck();
+        let text = format!("{}\n", "teh ".repeat(19)).repeat(30);
+        let contains =
+            |r: Rect, p: &Point| r.left <= p.x && p.x < r.right && r.top <= p.y && p.y < r.bottom;
+
+        // Without floats, every "teh" on screen is underlined (19 per row, 3 cells each).
+        let mut h = Harness::new(&text);
+        let all = h.curly_cells();
+        let textarea = h.outer("textarea");
+        assert!(all.len() >= 19 * 3 * (textarea.height() as usize - 1), "{}", all.len());
+
+        type Open = fn(&mut Harness);
+        let floats: [(&str, Open); 4] = [
+            ("flyout", |h| h.click_label("File")),
+            ("flyout", |h| h.click_label("Edit")),
+            ("about", |h| {
+                h.state.wants_about = true;
+                h.frame(None);
+            }),
+            ("spell-suggestions", |h| h.key(vk::F7)),
+        ];
+
+        for (classname, open) in floats {
+            let mut h = Harness::new(&text);
+            open(&mut h);
+            let float = h.outer(classname);
+            assert!(float.width() > 0 && float.height() > 0, "{classname}");
+
+            let cells = h.curly_cells();
+            // The rest of the text is still underlined.
+            assert!(cells.len() >= all.len() / 2, "{classname}: {}", cells.len());
+            let under: Vec<_> = cells.iter().filter(|p| contains(float, p)).collect();
+            assert!(under.is_empty(), "{classname} {float:?}: {under:?}");
+        }
     }
 }

@@ -885,6 +885,21 @@ fn mispeled_fn(speling: u32) {
     }
 
     #[test]
+    fn test_render_tabs() {
+        let _g = shared_globals();
+        // Tabs expand to the next tab stop, which moves the underline along with the word.
+        for (tab_size, expected) in [(4, 4), (8, 8)] {
+            let mut tb = buffer(None, "\tteh x\nab\twrod");
+            tb.set_tab_size(tab_size);
+            assert_eq!(
+                render(&mut tb, Point::default(), size(30, 2), false),
+                [run(0, expected, Curly, "teh"), run(1, expected, Curly, "wrod")],
+                "tab size {tab_size}"
+            );
+        }
+    }
+
+    #[test]
     fn test_render_plain_underline() {
         let _g = exclusive_globals();
         spellcheck::configure(true, false);
