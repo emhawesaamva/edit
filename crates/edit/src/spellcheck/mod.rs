@@ -143,9 +143,7 @@ pub fn suggest(dict: &Dictionary, word: &str) -> Vec<String> {
     // Measured on real misspellings (Wikipedia's list, Birkbeck, aspell), this beats spellbook's
     // order for capitalized common words and matches it for proper nouns.
     if is_capitalized(&word) {
-        let mut lower = Vec::new();
-        dict.suggest(&word.to_lowercase(), &mut lower);
-        let lower: Vec<String> = lower.iter().map(|s| capitalize(s)).collect();
+        let lower = suggest_lowercase(dict, &word, &suggestions);
         let first = suggestions
             .first()
             .filter(|s| keeps_first_place(dict, &word, s, lower.first()))
@@ -158,6 +156,17 @@ pub fn suggest(dict: &Dictionary, word: &str) -> Vec<String> {
         }
     }
 
+    // A contraction without its apostrophe ("dont", "Ive") is the likeliest mistake if adding one
+    // gives a word, but spellbook ranks it behind other single edits ("dot", "don", "don't"),
+    // and the reordering above pushes "I've" and "I'm" further down, because "ive" and "im"
+    // have no contraction among their suggestions. So it goes first, before the cut-off.
+    // The popup only looks up misspelled words, so this never applies to words that are
+    // correct without the apostrophe ("cant", "Ill").
+    // The apostrophe style is restored below.
+    if let Some(i) = suggestions.iter().position(|s| is_apostrophe_added(&word, s)) {
+        suggestions[..=i].rotate_right(1);
+    }
+
     suggestions.truncate(MAX_SUGGESTIONS);
 
     // Keep the user's apostrophe style.
@@ -168,6 +177,47 @@ pub fn suggest(dict: &Dictionary, word: &str) -> Vec<String> {
     }
 
     suggestions
+}
+
+/// spellbook's suggestions for the lowercase form of the capitalized `word`, capitalized again.
+/// `native` is spellbook's list for `word` itself.
+///
+/// spellbook lists the edits of a word first ("teh" -> "the"), then its ngram suggestions,
+/// which scan the whole word list. That scan is the slow part, and for `native` spellbook already
+/// ran it on the lowercase word (unless the edits found good matches). Running it again would
+/// double the time the popup takes to open, so the edits of the lowercase word are followed by
+/// `native` instead. Without its splits, though, which mostly come from capitalized abbreviations
+/// ("Di sparingly" for "Disparingly"): If the lowercase word has no edits, the splits would come
+/// first, ahead of its ngram suggestions ("Disparagingly").
+fn suggest_lowercase(dict: &Dictionary, word: &str, native: &[String]) -> Vec<String> {
+    let mut edits = Vec::new();
+    dict.suggester().with_ngram_suggestions(false).suggest(&word.to_lowercase(), &mut edits);
+    let mut lower: Vec<String> = edits.iter().map(|s| capitalize(s)).collect();
+    lower.extend(native.iter().filter(|s| !s.contains([' ', '-'])).cloned());
+    lower
+}
+
+/// Whether `suggestion` is `word` with one apostrophe inserted ("dont" -> "don't").
+///
+/// A possessive "'s" doesn't count, because the plural is usually meant ("heros" -> "heroes",
+/// not "hero's"), or a doubled "s" ("Pariss" -> "Paris"). Except after the words whose "'s"
+/// is short for "is" ("thats" -> "that's").
+fn is_apostrophe_added(word: &str, suggestion: &str) -> bool {
+    const IS_CONTRACTIONS: [&[u8]; 9] =
+        [b"he", b"here", b"how", b"she", b"that", b"there", b"what", b"where", b"who"];
+
+    let (word, suggestion) = (word.as_bytes(), suggestion.as_bytes());
+    let prefix = word.iter().zip(suggestion).take_while(|(a, b)| a == b).count();
+    let possessive = match suggestion {
+        [base @ .., b'\'', b's' | b'S'] => {
+            !IS_CONTRACTIONS.iter().any(|c| base.eq_ignore_ascii_case(c))
+        }
+        _ => false,
+    };
+    suggestion.len() == word.len() + 1
+        && suggestion.get(prefix) == Some(&b'\'')
+        && suggestion.get(prefix + 1..) == word.get(prefix..)
+        && !possessive
 }
 
 /// Whether the word starts with an uppercase letter and has no other uppercase letters ("Teh").
@@ -439,12 +489,136 @@ mod tests {
             assert!(ours.iter().all(|s| native.contains(s)), "{word}: {ours:?} vs {native:?}");
         }
 
-        // Lowercase words keep spellbook's order.
+        // Lowercase words keep spellbook's order (unless an apostrophe is missing, see below).
         for word in ["teh", "thier", "agian", "amercia"] {
             dict.suggest(word, &mut native);
             native.truncate(MAX_SUGGESTIONS);
             assert_eq!(suggest(dict, word), native, "{word}");
         }
+    }
+
+    // Regression: The capitalized "Ive" offered "Vie", "Ives" and "Iv" before "I've", and "Thats"
+    // offered "That's" last. spellbook itself ranks "don't" third for "dont".
+    #[test]
+    fn test_suggest_missing_apostrophe() {
+        let dict = dictionary_blocking().unwrap();
+        let first = |word: &str| suggest(dict, word).into_iter().next();
+        for (word, want) in [
+            ("Ive", "I've"),
+            ("Im", "I'm"),
+            ("Dont", "Don't"),
+            ("dont", "don't"),
+            ("doesnt", "doesn't"),
+            ("Thats", "That's"),
+            ("theres", "there's"),
+            ("theyre", "they're"),
+            ("oclock", "o'clock"),
+        ] {
+            assert_eq!(first(word).as_deref(), Some(want), "{word}");
+        }
+        // Not a possessive, though (Wikipedia's list of misspellings has "heroes" and "aircraft").
+        for (word, possessive) in [
+            ("heros", "hero's"),
+            ("Aircrafts", "Aircraft's"),
+            ("hertzs", "hertz's"),
+            ("Pariss", "Paris's"),
+        ] {
+            let suggestions = suggest(dict, word);
+            assert!(suggestions.iter().skip(1).any(|s| s == possessive), "{suggestions:?}");
+        }
+
+        // It merely moves up: The rest keeps its order.
+        let mut native = Vec::new();
+        dict.suggest("dont", &mut native);
+        native.truncate(MAX_SUGGESTIONS);
+        let mut ours = suggest(dict, "dont");
+        let i = native.iter().position(|s| s == "don't").unwrap();
+        assert!(i > 0, "{native:?}");
+        ours[..=i].rotate_left(1);
+        assert_eq!(ours, native);
+
+        // A misplaced apostrophe isn't a missing one. Its style is kept.
+        let typographic = suggest(dict, "does\u{2019}nt");
+        assert!(typographic.iter().any(|s| s == "doesn\u{2019}t"), "{typographic:?}");
+        assert!(typographic.iter().all(|s| !s.contains('\'')), "{typographic:?}");
+    }
+
+    #[test]
+    fn test_is_apostrophe_added() {
+        for (word, suggestion) in [
+            ("dont", "don't"),
+            ("Ive", "I've"),
+            ("oclock", "o'clock"),
+            ("tis", "'tis"),
+            ("dogs", "dogs'"),
+            ("thats", "that's"),
+            ("Thats", "That's"),
+            ("WHOS", "WHO'S"),
+            ("", "'"),
+        ] {
+            assert!(is_apostrophe_added(word, suggestion), "{word} {suggestion}");
+        }
+        for (word, suggestion) in [
+            // Possessives.
+            ("heros", "hero's"),
+            ("todays", "today's"),
+            ("Pariss", "Paris's"),
+            ("CLASSS", "CLASS'S"),
+            ("o'clocks", "o'clock's"),
+            ("cafés", "café's"),
+            ("s", "'s"),
+            ("thatts", "thatt's"),
+            ("dont", "dont"),
+            ("dont", "done"),
+            ("dont", "don''t"),
+            ("dont", "don\u{2019}t"),
+            ("doesnt", "doesn"),
+            ("does'nt", "doesn't"),
+            ("ive", "I've"),
+            ("dont", "do n't"),
+            ("é", "e'"),
+            ("", ""),
+        ] {
+            assert!(!is_apostrophe_added(word, suggestion), "{word} {suggestion}");
+        }
+    }
+
+    // Regression: The lowercase pass for capitalized words repeated spellbook's ngram scan
+    // over the whole word list, which doubled the time it takes to suggest something.
+    #[test]
+    fn test_suggest_lowercase_skips_ngrams() {
+        let dict = dictionary_blocking().unwrap();
+        let first = |word: &str| suggest(dict, word).into_iter().next();
+        let mut native = Vec::new();
+
+        // The edits of the lowercase word, capitalized.
+        dict.suggest("teh", &mut native);
+        let want: Vec<String> = native.iter().map(|s| capitalize(s)).collect();
+        assert_eq!(suggest_lowercase(dict, "Teh", &[]), want);
+
+        // Only the ngram scan finds "elephant". It's taken from spellbook's list for the word
+        // as typed, without the splits, instead of being run again.
+        dict.suggest("elephanttt", &mut native);
+        assert_eq!(native, ["elephant"]);
+        assert!(suggest_lowercase(dict, "Elephanttt", &[]).is_empty());
+        let fake: Vec<String> =
+            ["Elephant", "Ele phant", "Ele-phant", "Zebra"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(suggest_lowercase(dict, "Elephanttt", &fake), ["Elephant", "Zebra"]);
+        assert_eq!(first("Elephanttt").as_deref(), Some("Elephant"));
+
+        // spellbook lists the splits of the word as typed first ("Di sparingly"). They still don't
+        // beat the ngram suggestions when the lowercase word has no edits.
+        for (word, want) in [
+            ("Disparingly", "Disparagingly"),
+            ("Irregardless", "Regardless"),
+            ("Decidly", "Decidedly"),
+            ("Aspergerer", "Asperger"),
+        ] {
+            assert_eq!(first(word).as_deref(), Some(want), "{word}");
+        }
+        // The lowercase ranking keeps what edits of the word as typed find, too ("Canada").
+        let canadan = suggest(dict, "Canadan");
+        assert_eq!(canadan[..3], ["Canaan", "Canada", "Canadian"], "{canadan:?}");
     }
 
     #[test]
