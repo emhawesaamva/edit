@@ -103,6 +103,22 @@ mod tests {
         assert!(dictionary().is_some());
     }
 
+    #[test]
+    fn test_poll_timeout_after_loading() {
+        dictionary_blocking().unwrap();
+
+        // Only main.rs calls `poll_timeout()`, so this is the first call since loading finished:
+        // One immediate frame, so that the underlines appear, then back to waiting for input.
+        assert_eq!(poll_timeout(), Duration::ZERO);
+        assert_eq!(poll_timeout(), Duration::MAX);
+        assert_eq!(poll_timeout(), Duration::MAX);
+
+        // Loading again does nothing.
+        start_loading();
+        assert_eq!(dictionary_status(), DictionaryStatus::Ready);
+        assert_eq!(poll_timeout(), Duration::MAX);
+    }
+
     /// Run with `cargo test --release -p edit load_time -- --ignored --nocapture`.
     #[test]
     #[ignore]
@@ -122,6 +138,17 @@ mod tests {
         dict.suggest("recieve", &mut out);
         let suggest = beg.elapsed();
 
-        println!("load: {load:?}, check: {check:?}, suggest: {suggest:?}");
+        // `spellcheck::suggest()` asks twice for capitalized words.
+        let beg = std::time::Instant::now();
+        std::hint::black_box(super::super::suggest(&dict, "teh"));
+        let suggest_lower = beg.elapsed();
+        let beg = std::time::Instant::now();
+        std::hint::black_box(super::super::suggest(&dict, "Teh"));
+        let suggest_capitalized = beg.elapsed();
+
+        println!(
+            "load: {load:?}, check: {check:?}, suggest: {suggest:?}, \
+             spellcheck::suggest(\"teh\"): {suggest_lower:?}, spellcheck::suggest(\"Teh\"): {suggest_capitalized:?}"
+        );
     }
 }
