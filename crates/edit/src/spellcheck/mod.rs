@@ -4,7 +4,7 @@
 //! Spell checking, based on the `spellbook` crate and a bundled en_US Hunspell dictionary.
 //!
 //! The dictionary is parsed on a background thread (see [`start_loading`]).
-//! Until it's ready, [`dictionary`] returns `None` and spell checking silently does nothing.
+//! Until it's ready, [`dictionary()`] returns `None` and spell checking silently does nothing.
 //!
 //! The pieces:
 //! * [`tokenizer`] splits a line segment into candidate words.
@@ -88,7 +88,7 @@ pub fn is_word_correct(dict: &Dictionary, word: &str) -> bool {
     })
 }
 
-/// Returns up to [`MAX_SUGGESTIONS`] replacements for `word`. This can be slow, so call it once per request.
+/// Returns up to `MAX_SUGGESTIONS` (8) replacements for `word`. This can be slow, so call it once per request.
 pub fn suggest(dict: &Dictionary, word: &str) -> Vec<String> {
     if word.is_empty() || word.len() > MAX_WORD_LEN {
         return Vec::new();
