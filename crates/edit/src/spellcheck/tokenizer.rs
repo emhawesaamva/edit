@@ -60,10 +60,15 @@ pub enum TextKind {
     /// apostrophe, `` `n `` is a PowerShell escape and `N'...'` is a T-SQL Unicode string.
     /// Placeholders and variables are read like in a [`TextKind::CodeString`].
     VerbatimString,
+    /// A SQL string literal: like a [`TextKind::VerbatimString`], except that a backtick
+    /// is never an escape. It opens a code span (a MySQL quoted identifier) like in prose.
+    SqlString,
 }
 
 /// Calls `f` with the byte range of every candidate word in `text`, reading it as `kind`.
 pub fn for_each_word_in(text: &[u8], kind: TextKind, mut f: impl FnMut(Range<usize>)) {
+    // SKELETON (round 3 fixes): read as verbatim until the tokenizer part implements it.
+    let kind = if kind == TextKind::SqlString { TextKind::VerbatimString } else { kind };
     let verbatim = kind == TextKind::VerbatimString;
     let len = text.len();
     // Start of the current run.

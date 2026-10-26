@@ -40,10 +40,15 @@ pub enum Scope {
     GitCommit,
     /// Comments and strings.
     Code,
-    /// Comments and strings, in a language whose strings don't use `\` escapes (PowerShell, SQL).
+    /// Comments and strings, in PowerShell, whose strings don't use `\` escapes.
     CodeVerbatim,
+    /// Comments and strings, in SQL, whose strings don't use `\` escapes.
+    CodeSql,
     /// Comments only (data formats, whose strings are mostly identifiers).
     CommentsOnly,
+    /// A `git rebase -i` todo list: Commit subjects and `exec` lines (which its highlighter
+    /// yields as comments), minus git's `#` help text.
+    RebaseTodo,
 }
 
 impl Scope {
@@ -60,11 +65,11 @@ impl Scope {
             // Patches are mostly code and other people's prose. Underlining them is just noise.
             "diff" => Self::Off,
             // `\` is a path separator in their strings, not an escape.
-            "powershell" | "sql" => Self::CodeVerbatim,
+            "powershell" => Self::CodeVerbatim,
+            "sql" => Self::CodeSql,
+            "git-rebase" => Self::RebaseTodo,
             // Data formats: Their strings are mostly keys, paths and identifiers.
-            "git-rebase" | "ignore" | "json" | "properties" | "toml" | "xml" | "yaml" => {
-                Self::CommentsOnly
-            }
+            "ignore" | "json" | "properties" | "toml" | "xml" | "yaml" => Self::CommentsOnly,
             _ => Self::Code,
         }
     }
@@ -109,10 +114,10 @@ impl Scope {
             ),
             // `#` lines are comments, and `diff --git` is a header.
             Self::GitCommit => matches!(kind, HighlightKind::Other),
-            Self::Code | Self::CodeVerbatim => {
+            Self::Code | Self::CodeVerbatim | Self::CodeSql => {
                 matches!(kind, HighlightKind::Comment | HighlightKind::String)
             }
-            Self::CommentsOnly => matches!(kind, HighlightKind::Comment),
+            Self::CommentsOnly | Self::RebaseTodo => matches!(kind, HighlightKind::Comment),
         }
     }
 
@@ -122,7 +127,11 @@ impl Scope {
             Self::Off => true,
             Self::Markdown => md.next_line(line),
             Self::GitCommit => !starts_idle,
-            Self::Prose | Self::Code | Self::CodeVerbatim | Self::CommentsOnly => false,
+            // git's help text. (An indented `#` line isn't a comment to the highlighter.)
+            Self::RebaseTodo => line.first() == Some(&b'#'),
+            Self::Prose | Self::Code | Self::CodeVerbatim | Self::CodeSql | Self::CommentsOnly => {
+                false
+            }
         }
     }
 
@@ -152,6 +161,7 @@ impl Scope {
             _ if !string || comment => TextKind::Prose,
             Self::Code => TextKind::CodeString,
             Self::CodeVerbatim => TextKind::VerbatimString,
+            Self::CodeSql => TextKind::SqlString,
             _ => TextKind::Prose,
         };
         // The tokenizer masks `<!` through the next `>` like a tag, which would hide an XML comment
@@ -165,7 +175,7 @@ impl Scope {
                 seg.start += 4;
             }
             let text = &line[seg.clone()];
-            if kind == TextKind::VerbatimString
+            if kind == TextKind::SqlString
                 && text.len() >= 2
                 && text.starts_with(b"`")
                 && text.ends_with(b"`")
@@ -616,8 +626,8 @@ mod tests {
     #[test]
     fn test_for_language_covers_all_languages() {
         // NOTE: If this fails after merging upstream, a language was added or renamed.
-        // Decide whether its strings are prose (Code, or CodeVerbatim if `\` isn't an escape in
-        // them) or data (CommentsOnly) and update both `Scope::for_language` and this table.
+        // Decide whether its strings are prose (Code, or CodeVerbatim/CodeSql if `\` isn't an
+        // escape in them) or data (CommentsOnly) and update both `Scope::for_language` and this table.
         let expected = [
             ("c", Scope::Code),
             ("cpp", Scope::Code),
@@ -625,7 +635,7 @@ mod tests {
             ("diff", Scope::Off),
             ("fsharp", Scope::Code),
             ("git-commit", Scope::GitCommit),
-            ("git-rebase", Scope::CommentsOnly),
+            ("git-rebase", Scope::RebaseTodo),
             ("go", Scope::Code),
             ("ignore", Scope::CommentsOnly),
             ("java", Scope::Code),
@@ -641,7 +651,7 @@ mod tests {
             ("ruby", Scope::Code),
             ("rust", Scope::Code),
             ("shellscript", Scope::Code),
-            ("sql", Scope::CodeVerbatim),
+            ("sql", Scope::CodeSql),
             ("toml", Scope::CommentsOnly),
             ("xml", Scope::CommentsOnly),
             ("yaml", Scope::CommentsOnly),
@@ -674,6 +684,21 @@ mod tests {
     }
 
     #[test]
+    fn test_rebase_todo() {
+        // Commit subjects and `exec` lines are checked, git's help text isn't.
+        let doc = "pick 1a2b3c4 Fix teh widget\n\
+                   exec make tset\n\
+                   # Rebase 1a2b3c4..5d6e7f8 onto 1a2b3c4 (2 commands)\n\
+                   #\n\
+                   # Commands:\n\
+                   # p, pick <commit> = use commit\n\
+                   # x, exec <command> = run command (the rest of the line) using shell\n";
+        let lines = checked_lines(Some(language("git-rebase")), doc);
+        assert_eq!(&lines[..2], [Some("pick 1a2b3c4 Fix teh widget"), Some("exec make tset")]);
+        assert!(lines[2..].iter().all(Option::is_none), "{lines:?}");
+    }
+
+    #[test]
     fn test_needs_highlighter() {
         assert!(!Scope::Off.needs_highlighter());
         assert!(!Scope::Prose.needs_highlighter());
@@ -681,14 +706,18 @@ mod tests {
         assert!(Scope::GitCommit.needs_highlighter());
         assert!(Scope::Code.needs_highlighter());
         assert!(Scope::CodeVerbatim.needs_highlighter());
+        assert!(Scope::CodeSql.needs_highlighter());
         assert!(Scope::CommentsOnly.needs_highlighter());
+        assert!(Scope::RebaseTodo.needs_highlighter());
     }
 
     #[test]
     fn test_needs_state() {
         use Scope::*;
 
-        for scope in [Off, Prose, Markdown, GitCommit, Code, CodeVerbatim, CommentsOnly] {
+        for scope in
+            [Off, Prose, Markdown, GitCommit, Code, CodeVerbatim, CodeSql, CommentsOnly, RebaseTodo]
+        {
             assert_eq!(scope.needs_idle_state(), scope == GitCommit, "{scope:?}");
             assert_eq!(scope.needs_markdown_state(), scope == Markdown, "{scope:?}");
             // Both states are only meaningful along with highlights.
@@ -710,12 +739,14 @@ mod tests {
             MarkupStrikethrough,
             MarkupList,
         ];
-        let table: [(Scope, &[HighlightKind]); 5] = [
+        let table: [(Scope, &[HighlightKind]); 7] = [
             (Scope::Markdown, &markdown),
             (Scope::GitCommit, &[Other]),
             (Scope::Code, &[Comment, String]),
             (Scope::CodeVerbatim, &[Comment, String]),
+            (Scope::CodeSql, &[Comment, String]),
             (Scope::CommentsOnly, &[Comment]),
+            (Scope::RebaseTodo, &[Comment]),
         ];
 
         // The last kind (in declaration order) is `StorageType`.
@@ -1607,7 +1638,7 @@ multi line coment
 
     #[test]
     fn test_highlighter_kinds() {
-        use TextKind::{CodeString, Prose, VerbatimString};
+        use TextKind::{CodeString, Prose, SqlString, VerbatimString};
 
         let kinds = |language: Option<&'static Language>, line: &str| {
             let mut res = check_doc_with_kinds(language, line);
@@ -1647,17 +1678,13 @@ multi line coment
         let sql = Some(language("sql"));
         assert_eq!(
             kinds(sql, r"SELECT N'C:\Data', 'it''s' -- note"),
-            owned(&[
-                (r"N'C:\Data'", VerbatimString),
-                ("'it''s'", VerbatimString),
-                ("-- note", Prose)
-            ])
+            owned(&[(r"N'C:\Data'", SqlString), ("'it''s'", SqlString), ("-- note", Prose)])
         );
         assert_eq!(kinds(sql, "/* note */"), owned(&[("/* note */", Prose)]));
         // MySQL's quoted identifiers are names, and a backtick isn't an escape in SQL.
         assert_eq!(
             kinds(sql, "SELECT `Customers`, \"Orders\" FROM `my db`.`t` -- `note`"),
-            owned(&[("\"Orders\"", VerbatimString), ("-- `note`", Prose)])
+            owned(&[("\"Orders\"", SqlString), ("-- `note`", Prose)])
         );
 
         // Data formats only check comments.
