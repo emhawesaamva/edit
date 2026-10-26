@@ -1265,6 +1265,7 @@ impl TextBuffer {
         while let Some(range) = self.find_select_next(&mut search, offset, false) {
             // Fork: microsoft/edit#994, Replace All loops when the last match ends at EOF
             if range.start < offset {
+                self.cursor_move_to_offset(offset);
                 break;
             }
             let replacement =
@@ -1276,7 +1277,12 @@ impl TextBuffer {
 
             // The `active_edit_off` points to the end of the last edit made by `write_raw()`.
             // This differs from the self.cursor.offset, if `write_raw()` did an `insert_final_newline`.
-            offset = self.active_edit_off;
+            // Fork: microsoft/edit#994, an empty match replaced with nothing isn't an edit.
+            offset = if range.is_empty() && replacement.is_empty() {
+                range.start
+            } else {
+                self.active_edit_off
+            };
 
             // Avoid infinite loops when hitting zero-length matches
             // by advancing past the zero-length match location.

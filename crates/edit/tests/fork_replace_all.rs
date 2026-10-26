@@ -1,12 +1,13 @@
 // Licensed under the MIT License.
 // Fork-only: tests a fork fix in upstream code (not part of upstream microsoft/edit).
 
-//! Replace All when the last match ends at the end of the file.
+//! Replace All when the last match ends at the end of the file, and with empty regex matches.
 //!
 //! Upstream's `TextBuffer::find_and_replace_all()` resumed the search at the end of the text,
 //! and ICU then searched again from the start. So if the replacement matched again
 //! (same text, another case, or containing the pattern), it never returned.
-//! Reported upstream as microsoft/edit#994.
+//! It also resumed at the last edit after an empty match replaced with nothing (no edit),
+//! so `[ \t]*$` -> "" found the same match forever. Reported upstream as microsoft/edit#994.
 //! Each test runs on a helper thread with a timeout, so that a regression fails instead of hanging.
 
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -26,13 +27,35 @@ fn replace_all(
     pattern: &'static str,
     replacement: &'static str,
 ) -> String {
+    replace_all_with(text, final_newline, pattern, SearchOptions::default(), replacement)
+}
+
+/// [`replace_all`] with regex search.
+fn replace_all_regex(
+    text: &'static str,
+    pattern: &'static str,
+    replacement: &'static str,
+) -> String {
+    let options = SearchOptions { use_regex: true, ..Default::default() };
+    replace_all_with(text, false, pattern, options, replacement)
+}
+
+fn replace_all_with(
+    text: &'static str,
+    final_newline: bool,
+    pattern: &'static str,
+    options: SearchOptions,
+    replacement: &'static str,
+) -> String {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let mut tb = TextBuffer::new(false).unwrap();
         tb.set_crlf(false);
         tb.write_raw(text.as_bytes());
         tb.set_insert_final_newline(final_newline);
-        tb.find_and_replace_all(pattern, SearchOptions::default(), replacement.as_bytes()).unwrap();
+        tb.find_and_replace_all(pattern, options, replacement.as_bytes()).unwrap();
+        // Nothing stays selected, like after any other Replace All.
+        assert!(!tb.has_selection(), "a match is still selected");
         _ = tx.send(contents(&tb));
     });
 
@@ -41,7 +64,7 @@ fn replace_all(
         Err(RecvTimeoutError::Timeout) => panic!(
             "Replace All {pattern:?} -> {replacement:?} in {text:?} didn't return within {TIMEOUT:?}"
         ),
-        Err(RecvTimeoutError::Disconnected) => panic!("Replace All panicked"),
+        Err(RecvTimeoutError::Disconnected) => panic!("Replace All panicked or failed a check"),
     }
 }
 
@@ -79,6 +102,13 @@ fn test_replacement_equals_pattern_at_eof() {
 #[test]
 fn test_final_newline_after_match_at_eof() {
     assert_eq!(replace_all("x a", true, "a", "aa"), "x aa\n");
+}
+
+// Stripping trailing whitespace: the empty match at the end of "c" isn't an edit.
+#[test]
+fn test_empty_match_replaced_with_nothing() {
+    assert_eq!(replace_all_regex("a  \nb \nc\n", r"[ \t]*$", ""), "a\nb\nc\n");
+    assert_eq!(replace_all_regex("a\nb", r"[ \t]*$", ""), "a\nb");
 }
 
 // These already worked: the last match is followed by a newline, or the replacement doesn't match.
