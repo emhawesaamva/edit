@@ -18,7 +18,9 @@ const AFF: &str = include_str!("../../../../assets/dictionaries/en_US/index.aff"
 const DIC: &str = include_str!("../../../../assets/dictionaries/en_US/index.dic");
 
 /// How often the main loop should wake up while the dictionary is loading.
-const LOADING_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// A release build loads it in a few ms, but the first frame is drawn even sooner,
+/// so the first underlines wait for the next wake-up. Each one costs a no-op frame.
+const LOADING_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// `None` inside the `OnceLock` means that loading failed.
 static DICTIONARY: OnceLock<Option<Dictionary>> = OnceLock::new();
@@ -117,6 +119,12 @@ mod tests {
         start_loading();
         assert_eq!(dictionary_status(), DictionaryStatus::Ready);
         assert_eq!(poll_timeout(), Duration::MAX);
+    }
+
+    // Regression: at 50 ms, the first underlines showed up ~50 ms after the first frame.
+    #[test]
+    fn test_loading_poll_interval() {
+        assert!(LOADING_POLL_INTERVAL <= Duration::from_millis(10));
     }
 
     /// Run with `cargo test --release -p edit load_time -- --ignored --nocapture`.
