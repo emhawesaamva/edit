@@ -177,6 +177,8 @@ pub struct State {
     pub osc_clipboard_sync: bool,
     pub osc_clipboard_always_send: bool,
     pub exit: bool,
+
+    pub spell: crate::draw_spellcheck::SpellUi, // Fork: spellcheck
 }
 
 impl State {
@@ -227,6 +229,8 @@ impl State {
             osc_clipboard_sync: false,
             osc_clipboard_always_send: false,
             exit: false,
+
+            spell: Default::default(), // Fork: spellcheck
         })
     }
 

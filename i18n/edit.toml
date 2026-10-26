@@ -2186,3 +2186,30 @@ uk = "Файл вже існує. Перезаписати?"
 vi = "Tệp đã tồn tại. Bạn có muốn ghi đè không?"
 zh-hans = "文件已存在。要覆盖它吗？"
 zh-hant = "檔案已存在。要覆寫嗎？"
+
+# Fork: spellcheck (not part of upstream microsoft/edit).
+# English only. The build script falls back to "en" for missing languages.
+
+# View menu checkbox that toggles spell checking
+[ViewSpellCheck]
+en = "Spell Check"
+
+# Edit menu entry that opens the suggestions popup for the misspelled word at the cursor
+[EditSpellingSuggestions]
+en = "Spelling Suggestions…"
+
+# Shown in the suggestions popup if the dictionary has no replacements for the word
+[SpellNoSuggestions]
+en = "No suggestions"
+
+# Shown in the suggestions popup if the word at the cursor is spelled correctly
+[SpellNoMisspelling]
+en = "No misspelled word at cursor"
+
+# Shown in the suggestions popup while the dictionary is still being loaded
+[SpellLoading]
+en = "Loading dictionary…"
+
+# Shown in the suggestions popup if the dictionary failed to load
+[SpellUnavailable]
+en = "Spell check unavailable"

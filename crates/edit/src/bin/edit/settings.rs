@@ -11,6 +11,9 @@ use crate::apperr;
 pub struct Settings {
     pub path: PathBuf,
     pub file_associations: Vec<(String, &'static Language)>,
+    // Fork: spellcheck
+    pub spellcheck_enabled: bool,
+    pub spellcheck_curly: bool,
 }
 
 struct SettingsCell(SemiRefCell<Settings>);
@@ -27,7 +30,13 @@ impl Settings {
     }
 
     const fn new() -> Self {
-        Settings { path: PathBuf::new(), file_associations: Vec::new() }
+        Settings {
+            path: PathBuf::new(),
+            file_associations: Vec::new(),
+            // Fork: spellcheck
+            spellcheck_enabled: true,
+            spellcheck_curly: true,
+        }
     }
 
     pub fn borrow() -> Ref<'static, Settings> {
@@ -81,6 +90,28 @@ impl Settings {
             }
         }
 
+        self.load_spellcheck(root)?; // Fork: spellcheck
+
+        Ok(())
+    }
+
+    // Fork: spellcheck
+    fn load_spellcheck(&mut self, root: json::Object) -> apperr::Result<()> {
+        if let Some(value) = root.get("spellcheck.enabled") {
+            let Some(enabled) = value.as_bool() else {
+                return Err(apperr::Error::SettingsInvalid("spellcheck.enabled"));
+            };
+            self.spellcheck_enabled = enabled;
+        }
+
+        if let Some(value) = root.get("spellcheck.underline") {
+            self.spellcheck_curly = match value.as_str() {
+                Some("curly") => true,
+                Some("plain") => false,
+                _ => return Err(apperr::Error::SettingsInvalid("spellcheck.underline")),
+            };
+        }
+
         Ok(())
     }
 }
@@ -114,5 +145,88 @@ fn config_dir() -> Option<PathBuf> {
         var_path("XDG_CONFIG_HOME")
             .or_else(|| var_path("HOME").map(|p| push(p, ".config")))
             .map(|p| push(p, "msedit"))
+    }
+}
+
+// Fork: spellcheck
+#[cfg(test)]
+mod tests {
+    use edit::arena::scratch_arena;
+
+    use super::*;
+
+    // Applies `text` the way `load()` does, without touching the settings file.
+    fn load_spellcheck(text: &str) -> apperr::Result<Settings> {
+        let scratch = scratch_arena(None);
+        let json = json::parse(&scratch, text).unwrap();
+        let mut settings = Settings::new();
+        settings.load_spellcheck(json.as_object().unwrap())?;
+        Ok(settings)
+    }
+
+    #[test]
+    fn test_spellcheck_defaults() {
+        let s = Settings::new();
+        assert!(s.spellcheck_enabled);
+        assert!(s.spellcheck_curly);
+
+        let s = load_spellcheck("{}").unwrap();
+        assert!(s.spellcheck_enabled);
+        assert!(s.spellcheck_curly);
+
+        let s = load_spellcheck(r#"{ "files.associations": {}, "spellcheck": false }"#).unwrap();
+        assert!(s.spellcheck_enabled);
+        assert!(s.spellcheck_curly);
+    }
+
+    #[test]
+    fn test_spellcheck_values() {
+        let s = load_spellcheck(r#"{ "spellcheck.enabled": false }"#).unwrap();
+        assert!(!s.spellcheck_enabled);
+        assert!(s.spellcheck_curly);
+
+        let s = load_spellcheck(r#"{ "spellcheck.underline": "plain" }"#).unwrap();
+        assert!(s.spellcheck_enabled);
+        assert!(!s.spellcheck_curly);
+
+        let s = load_spellcheck(
+            r#"{
+                // Comments and trailing commas are allowed.
+                "spellcheck.enabled": true,
+                "spellcheck.underline": "curly",
+            }"#,
+        )
+        .unwrap();
+        assert!(s.spellcheck_enabled);
+        assert!(s.spellcheck_curly);
+    }
+
+    #[test]
+    fn test_spellcheck_invalid() {
+        for text in [
+            r#"{ "spellcheck.underline": "wavy" }"#,
+            r#"{ "spellcheck.underline": "Curly" }"#,
+            r#"{ "spellcheck.underline": "" }"#,
+            r#"{ "spellcheck.underline": true }"#,
+            r#"{ "spellcheck.underline": null }"#,
+        ] {
+            let res = load_spellcheck(text);
+            assert!(
+                matches!(res, Err(apperr::Error::SettingsInvalid("spellcheck.underline"))),
+                "{text}"
+            );
+        }
+
+        for text in [
+            r#"{ "spellcheck.enabled": "false" }"#,
+            r#"{ "spellcheck.enabled": 0 }"#,
+            r#"{ "spellcheck.enabled": null }"#,
+        ] {
+            let res = load_spellcheck(text);
+            assert!(
+                matches!(res, Err(apperr::Error::SettingsInvalid("spellcheck.enabled"))),
+                "{text}"
+            );
+        }
     }
 }

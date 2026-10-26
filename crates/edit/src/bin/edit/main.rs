@@ -6,6 +6,7 @@ mod documents;
 mod draw_editor;
 mod draw_filepicker;
 mod draw_menubar;
+mod draw_spellcheck; // Fork: spellcheck
 mod draw_statusbar;
 mod localization;
 mod settings;
@@ -80,6 +81,13 @@ fn run() -> apperr::Result<()> {
         return Ok(());
     }
 
+    // Fork: spellcheck. Starts loading the dictionary in the background, if enabled.
+    // It's done after `handle_args`, so that `--help` and `--version` don't pay for it.
+    {
+        let settings = Settings::borrow();
+        edit::spellcheck::configure(settings.spellcheck_enabled, settings.spellcheck_curly);
+    }
+
     handle_stdin(&mut state)?;
 
     let mut vt_parser = vt::Parser::new();
@@ -128,6 +136,7 @@ fn run() -> apperr::Result<()> {
         {
             let scratch = scratch_arena(None);
             let read_timeout = vt_parser.read_timeout().min(tui.read_timeout());
+            let read_timeout = read_timeout.min(edit::spellcheck::poll_timeout()); // Fork: spellcheck
             let Some((resize, input)) = sys::read_stdin(&scratch, read_timeout) else {
                 break;
             };

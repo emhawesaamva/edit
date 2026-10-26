@@ -32,6 +32,13 @@ pub fn draw_editor(ctx: &mut Context, state: &mut State) {
     }
 
     ctx.attr_intrinsic_size(Size { width: 0, height: size.height - height_reduction });
+
+    // Fork: spellcheck. Must come right after the textarea, because the popup is anchored to it.
+    crate::draw_spellcheck::draw_spellcheck(
+        ctx,
+        state,
+        Size { width: size.width, height: size.height - height_reduction },
+    );
 }
 
 fn draw_search(ctx: &mut Context, state: &mut State) {
