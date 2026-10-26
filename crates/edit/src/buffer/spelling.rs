@@ -999,6 +999,57 @@ In `code` and [link tetx](https://example.com/speling) too.
         assert_eq!(collect(&mut tb), ["teh"]);
         let mut tb = buffer(Some("git-commit"), doc);
         assert_eq!(collect(&mut tb), ["teh"]);
+
+        // PowerShell and SQL strings are verbatim: `\` is part of a path in them, not an escape.
+        // As code strings, these paths were flagged in pieces (ocuments, icrosoft, uarterly, ...).
+        let doc = r#"$docs = "$env:USERPROFILE\Documents\Reports"
+$p = 'C:\Program Files\Microsoft Office\root'
+$key = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion'
+$share = '\\fileserver\Finance\Quarterly Reports'
+$h = @"
+Logs go to C:\Temp\Log Files\archive with teh rest
+"@
+Write-Host "Found $count itmes in $path"
+# a coment about C:\Program Files\Microsoft Office
+<# a block coment #>
+"#;
+        let mut tb = buffer(Some("powershell"), doc);
+        assert_eq!(collect(&mut tb), ["teh", "itmes", "coment", "coment"]);
+
+        let doc = r"BULK INSERT dbo.Staging FROM 'C:\Data Files\Imports\vendor.csv';
+SELECT * FROM t WHERE path = '\\fileserver\Finance\Quarterly Reports';
+SELECT 'Domain\UserNmae teh' AS login;
+-- a coment
+/* a block coment */
+";
+        let mut tb = buffer(Some("sql"), doc);
+        assert_eq!(collect(&mut tb), ["teh", "coment", "coment"]);
+    }
+
+    /// The rest of [`TextKind::VerbatimString`](tokenizer::TextKind::VerbatimString), which the
+    /// tokenizer reads as prose until fix-r2-tokenizer lands. Re-enable this test along with it.
+    #[test]
+    #[ignore = "needs fix-r2-tokenizer"]
+    fn test_collect_verbatim_strings() {
+        let _g = shared_globals();
+
+        // `` `n `` and `` `t `` are escapes. As prose, two of them mask the text between them
+        // like Markdown inline code. `''` is an apostrophe, and `$usrname` a variable.
+        let doc = r#"Write-Host "Line1`nThe quick fox jumpd`nLine3"
+Write-Host "Done`nNext wrod`tTabbed"
+$x = 'It isn''t wierd'
+Write-Host "Hello $usrname, $cnt files"
+"#;
+        let mut tb = buffer(Some("powershell"), doc);
+        assert_eq!(collect(&mut tb), ["jumpd", "wrod", "wierd"]);
+
+        // `N'...'` is a Unicode string, `''` an apostrophe and `%ld` a printf spec (RAISERROR).
+        let doc = r"SELECT N'Hello world', N'Welcome back';
+SELECT 'It isn''t wierd';
+RAISERROR('Found %ld itmes', 16, 1);
+";
+        let mut tb = buffer(Some("sql"), doc);
+        assert_eq!(collect(&mut tb), ["wierd", "itmes"]);
     }
 
     #[test]

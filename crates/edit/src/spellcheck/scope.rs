@@ -40,6 +40,8 @@ pub enum Scope {
     GitCommit,
     /// Comments and strings.
     Code,
+    /// Comments and strings, in a language whose strings don't use `\` escapes (PowerShell, SQL).
+    CodeVerbatim,
     /// Comments only (data formats, whose strings are mostly identifiers).
     CommentsOnly,
 }
@@ -57,6 +59,8 @@ impl Scope {
             "git-commit" => Self::GitCommit,
             // Patches are mostly code and other people's prose. Underlining them is just noise.
             "diff" => Self::Off,
+            // `\` is a path separator in their strings, not an escape.
+            "powershell" | "sql" => Self::CodeVerbatim,
             // Data formats: Their strings are mostly keys, paths and identifiers.
             "git-rebase" | "ignore" | "json" | "properties" | "toml" | "xml" | "yaml" => {
                 Self::CommentsOnly
@@ -105,7 +109,9 @@ impl Scope {
             ),
             // `#` lines are comments, and `diff --git` is a header.
             Self::GitCommit => matches!(kind, HighlightKind::Other),
-            Self::Code => matches!(kind, HighlightKind::Comment | HighlightKind::String),
+            Self::Code | Self::CodeVerbatim => {
+                matches!(kind, HighlightKind::Comment | HighlightKind::String)
+            }
             Self::CommentsOnly => matches!(kind, HighlightKind::Comment),
         }
     }
@@ -116,7 +122,7 @@ impl Scope {
             Self::Off => true,
             Self::Markdown => md.next_line(line),
             Self::GitCommit => !starts_idle,
-            Self::Prose | Self::Code | Self::CommentsOnly => false,
+            Self::Prose | Self::Code | Self::CodeVerbatim | Self::CommentsOnly => false,
         }
     }
 
@@ -142,12 +148,11 @@ impl Scope {
         let to_line = |off: usize| off.saturating_sub(line_offset).min(line.len());
         // Only code has string literals. Markdown's strings are link text and inline code, which are prose.
         // A string that runs into a comment (`"a"// b`) is one segment, and comments are prose, too.
-        let kind = |string: bool, comment: bool| {
-            if self == Self::Code && string && !comment {
-                TextKind::CodeString
-            } else {
-                TextKind::Prose
-            }
+        let kind = |string: bool, comment: bool| match self {
+            _ if !string || comment => TextKind::Prose,
+            Self::Code => TextKind::CodeString,
+            Self::CodeVerbatim => TextKind::VerbatimString,
+            _ => TextKind::Prose,
         };
         // How far we got. Clamping each span's start to it keeps the output ascending,
         // even if the spans aren't (they always are, but this costs nothing).
@@ -435,8 +440,8 @@ mod tests {
     #[test]
     fn test_for_language_covers_all_languages() {
         // NOTE: If this fails after merging upstream, a language was added or renamed.
-        // Decide whether its strings are prose (Code) or data (CommentsOnly) and update
-        // both `Scope::for_language` and this table.
+        // Decide whether its strings are prose (Code, or CodeVerbatim if `\` isn't an escape in
+        // them) or data (CommentsOnly) and update both `Scope::for_language` and this table.
         let expected = [
             ("c", Scope::Code),
             ("cpp", Scope::Code),
@@ -454,13 +459,13 @@ mod tests {
             ("lua", Scope::Code),
             ("markdown", Scope::Markdown),
             ("odin", Scope::Code),
-            ("powershell", Scope::Code),
+            ("powershell", Scope::CodeVerbatim),
             ("properties", Scope::CommentsOnly),
             ("python", Scope::Code),
             ("ruby", Scope::Code),
             ("rust", Scope::Code),
             ("shellscript", Scope::Code),
-            ("sql", Scope::Code),
+            ("sql", Scope::CodeVerbatim),
             ("toml", Scope::CommentsOnly),
             ("xml", Scope::CommentsOnly),
             ("yaml", Scope::CommentsOnly),
@@ -499,6 +504,7 @@ mod tests {
         assert!(Scope::Markdown.needs_highlighter());
         assert!(Scope::GitCommit.needs_highlighter());
         assert!(Scope::Code.needs_highlighter());
+        assert!(Scope::CodeVerbatim.needs_highlighter());
         assert!(Scope::CommentsOnly.needs_highlighter());
     }
 
@@ -506,7 +512,7 @@ mod tests {
     fn test_needs_state() {
         use Scope::*;
 
-        for scope in [Off, Prose, Markdown, GitCommit, Code, CommentsOnly] {
+        for scope in [Off, Prose, Markdown, GitCommit, Code, CodeVerbatim, CommentsOnly] {
             assert_eq!(scope.needs_idle_state(), scope == GitCommit, "{scope:?}");
             assert_eq!(scope.needs_markdown_state(), scope == Markdown, "{scope:?}");
             // Both states are only meaningful along with highlights.
@@ -528,10 +534,11 @@ mod tests {
             MarkupStrikethrough,
             MarkupList,
         ];
-        let table: [(Scope, &[HighlightKind]); 4] = [
+        let table: [(Scope, &[HighlightKind]); 5] = [
             (Scope::Markdown, &markdown),
             (Scope::GitCommit, &[Other]),
             (Scope::Code, &[Comment, String]),
+            (Scope::CodeVerbatim, &[Comment, String]),
             (Scope::CommentsOnly, &[Comment]),
         ];
 
@@ -572,7 +579,13 @@ mod tests {
 
     #[test]
     fn test_segments_empty_highlights() {
-        for scope in [Scope::Markdown, Scope::GitCommit, Scope::Code, Scope::CommentsOnly] {
+        for scope in [
+            Scope::Markdown,
+            Scope::GitCommit,
+            Scope::Code,
+            Scope::CodeVerbatim,
+            Scope::CommentsOnly,
+        ] {
             assert_eq!(segments(scope, "hello world", 0, &[]), [], "{scope:?}");
         }
     }
@@ -604,6 +617,7 @@ mod tests {
 
         // Code only checks the link text, which is a string.
         assert_eq!(segments(Scope::Code, line, off, &hl), [22..26]);
+        assert_eq!(segments(Scope::CodeVerbatim, line, off, &hl), [22..26]);
         assert_eq!(segments(Scope::CommentsOnly, line, off, &hl), []);
         assert_eq!(segments(Scope::GitCommit, line, off, &hl), [0..4, 12..22, 26..28, 31..35]);
     }
@@ -635,7 +649,7 @@ mod tests {
     #[allow(clippy::single_range_in_vec_init)]
     fn test_segments_kinds() {
         use HighlightKind::*;
-        use TextKind::{CodeString, Prose};
+        use TextKind::{CodeString, Prose, VerbatimString};
 
         // `let s = "some text"; // a comment`
         let line = r#"let s = "some text"; // a comment"#;
@@ -678,6 +692,26 @@ mod tests {
         // Empty spans don't change the kind.
         let hl = [span(0, String), span(2, Comment), span(2, String), span(4, Other)];
         assert_eq!(segments_with_kinds(Scope::Code, "\"ab\"", 0, &hl), [(0..4, CodeString)]);
+
+        // PowerShell and SQL strings are verbatim. Comments are prose, as in all code.
+        let line = r#""ab" + /* c */ + "d""#;
+        let hl = [
+            span(0, String),
+            span(4, Other),
+            span(7, Comment),
+            span(14, Other),
+            span(17, String),
+            span(line.len(), Other),
+        ];
+        assert_eq!(
+            segments_with_kinds(Scope::CodeVerbatim, line, 0, &hl),
+            [(0..4, VerbatimString), (7..14, Prose), (17..20, VerbatimString)]
+        );
+        let hl = [span(0, String), span(4, Comment), span(9, Other)];
+        assert_eq!(
+            segments_with_kinds(Scope::CodeVerbatim, "\"ab\"// cd", 0, &hl),
+            [(0..9, Prose)]
+        );
 
         // Markdown's strings are link text and inline code. Commit messages have none.
         let line = "see [the docs](url) now";
@@ -797,6 +831,7 @@ mod tests {
                 assert!(Scope::Off.skip_line(line, idle, &mut md));
                 assert!(!Scope::Prose.skip_line(line, idle, &mut md));
                 assert!(!Scope::Code.skip_line(line, idle, &mut md));
+                assert!(!Scope::CodeVerbatim.skip_line(line, idle, &mut md));
                 assert!(!Scope::CommentsOnly.skip_line(line, idle, &mut md));
             }
             assert!(!Scope::GitCommit.skip_line(line, true, &mut md));
@@ -1136,7 +1171,7 @@ fn main() {
 
     #[test]
     fn test_highlighter_kinds() {
-        use TextKind::{CodeString, Prose};
+        use TextKind::{CodeString, Prose, VerbatimString};
 
         let kinds = |language: Option<&'static Language>, line: &str| {
             let mut res = check_doc_with_kinds(language, line);
@@ -1162,6 +1197,27 @@ fn main() {
             kinds(python, "x = 'text' # note"),
             owned(&[("'text'", CodeString), ("# note", Prose)])
         );
+
+        // PowerShell's and SQL's are verbatim: `\` isn't an escape in them.
+        let powershell = Some(language("powershell"));
+        assert_eq!(
+            kinds(powershell, r#"$p = "$env:TEMP\Logs`n" # note"#),
+            owned(&[(r#""$env:TEMP\Logs`n""#, VerbatimString), ("# note", Prose)])
+        );
+        assert_eq!(
+            kinds(powershell, r"Get-Item 'HKLM:\SOFTWARE' <# note #>"),
+            owned(&[(r"'HKLM:\SOFTWARE'", VerbatimString), ("<# note #>", Prose)])
+        );
+        let sql = Some(language("sql"));
+        assert_eq!(
+            kinds(sql, r"SELECT N'C:\Data', 'it''s' -- note"),
+            owned(&[
+                (r"N'C:\Data'", VerbatimString),
+                ("'it''s'", VerbatimString),
+                ("-- note", Prose)
+            ])
+        );
+        assert_eq!(kinds(sql, "/* note */"), owned(&[("/* note */", Prose)]));
 
         // Data formats only check comments.
         assert_eq!(
