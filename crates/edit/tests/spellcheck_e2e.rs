@@ -882,6 +882,63 @@ fn word_wrap_is_remembered() {
     assert_eq!(dir.read_config("view-state.json"), "{\n    \"wordWrap\": true\n}\n");
 }
 
+// File > Reopen Files at Startup: starting without files reopens the last ones, with their cursors.
+#[test]
+fn reopen_files_at_startup() {
+    let dir = TempDir::new();
+    let alpha = dir.write("alpha.txt", "Alpha file\n");
+    let bravo = dir.write("bravo.txt", "Bravo file\nsecond line here\n");
+    let charlie = dir.write("charlie.txt", "Charlie file\n");
+    let open_file_menu = |editor: &mut Editor| {
+        let screen = editor.wait_screen("the menu bar", |s| s.contains("File"));
+        editor.left_click(screen.find("File").unwrap());
+        let screen = editor.wait_screen("the File menu", |s| s.contains("Reopen Files"));
+        screen.find("Reopen").unwrap()
+    };
+
+    // Turn the option on, move the cursor, and quit.
+    let mut editor = Editor::spawn(&dir, &[&alpha, &bravo]);
+    editor.wait_screen("bravo.txt", |s| s.contains("Bravo file"));
+    let item = open_file_menu(&mut editor);
+    editor.left_click(item);
+    editor.wait_screen("the menu to close", |s| !s.contains("Reopen Files"));
+    assert!(dir.read_config("view-state.json").contains("\"reopenFiles\": true"));
+    let session = dir.read_config("session.json");
+    assert!(session.contains("alpha.txt") && session.contains("bravo.txt"), "{session}");
+    editor.send(&format!("{DOWN}{RIGHT}{RIGHT}{RIGHT}"));
+    editor.wait_screen("the cursor at 2:4", |s| s.location() == Some((2, 4)));
+    editor.send("\x11"); // Ctrl+Q
+    assert!(editor.wait_exit().success());
+
+    // Both files come back, bravo.txt in front, with its cursor.
+    let mut editor = Editor::spawn(&dir, &[]);
+    editor.wait_screen("bravo.txt at 2:4", |s| {
+        s.contains("Bravo file") && s.location() == Some((2, 4))
+    });
+    // Closing it is saved right away, even if the editor is killed (like closing the terminal).
+    editor.send("\x17"); // Ctrl+W
+    editor.wait_screen("alpha.txt", |s| s.contains("Alpha file"));
+    drop(editor);
+    let editor = Editor::spawn(&dir, &[]);
+    editor.wait_screen("alpha.txt", |s| s.contains("Alpha file"));
+    drop(editor);
+
+    // Files on the command line win, and become the last session.
+    let mut editor = Editor::spawn(&dir, &[&charlie]);
+    let screen = editor.wait_screen("charlie.txt", |s| s.contains("Charlie file"));
+    assert!(!screen.contains("Alpha file"), "{}", screen.dump());
+
+    // Turning the option off forgets the files.
+    let item = open_file_menu(&mut editor);
+    editor.left_click(item);
+    editor.wait_screen("the menu to close", |s| !s.contains("Reopen Files"));
+    assert_eq!(dir.read_config("session.json"), "");
+    drop(editor);
+    let editor = Editor::spawn(&dir, &[]);
+    let screen = editor.wait_screen("an untitled document", |s| s.contains("Untitled"));
+    assert!(!screen.contains("Charlie file"), "{}", screen.dump());
+}
+
 #[test]
 fn markdown_code_block() {
     let dir = TempDir::new();

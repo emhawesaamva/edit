@@ -9,6 +9,7 @@ mod draw_menubar;
 mod draw_spellcheck; // Fork: spellcheck
 mod draw_statusbar;
 mod localization;
+mod session; // Fork: reopen files
 mod settings;
 mod state;
 mod view_state; // Fork: remember View choices
@@ -78,6 +79,7 @@ fn run() -> apperr::Result<()> {
         state.add_error(err);
     }
     view_state::load(&Settings::borrow().path); // Fork: remember View choices
+    session::load(&Settings::borrow().path); // Fork: reopen files
 
     if handle_args(&mut state)? {
         return Ok(());
@@ -189,6 +191,8 @@ fn run() -> apperr::Result<()> {
             }
         }
 
+        session::update(&state.documents, state.wants_exit); // Fork: reopen files
+
         if state.exit {
             break;
         }
@@ -250,6 +254,7 @@ fn run() -> apperr::Result<()> {
         }
     }
 
+    session::update(&state.documents, true); // Fork: reopen files
     Ok(())
 }
 
@@ -331,8 +336,8 @@ fn handle_stdin(state: &mut State) -> apperr::Result<()> {
         let mut tb = doc.buffer.borrow_mut();
         tb.read_file(&mut file, None)?;
         tb.mark_as_dirty();
-    } else if state.documents.len() == 0 {
-        // No files were passed, and stdin is not redirected.
+    } else if state.documents.len() == 0 && !session::restore(&mut state.documents) {
+        // No files were passed (and none reopened; Fork: reopen files), and stdin is not redirected.
         state.documents.add_untitled()?;
     }
     Ok(())
@@ -434,6 +439,7 @@ fn draw(tui: &mut Tui, input: Option<input::Input>, state: &mut State) {
 }
 
 fn draw_handle_wants_exit(_ctx: &mut Context, state: &mut State) {
+    session::update(&state.documents, true); // Fork: reopen files, before any document is closed
     while let Some(doc) = state.documents.active() {
         if doc.buffer.borrow().is_dirty() {
             state.wants_close = true;

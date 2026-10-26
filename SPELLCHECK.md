@@ -111,20 +111,10 @@ cursor moves.
 In a diff or patch, where nothing is checked, F7, Ctrl+T and Edit > Spelling Suggestions show
 nothing, and a right-click only moves the cursor.
 
-**View > Spell Check** turns spell checking on or off, and `edit` starts that way next time (see
-[Remembered View choices](#remembered-view-choices)). While it's off, the shortcuts do nothing and
-the Edit menu item is hidden. A right-click still moves the cursor and gives the document the focus.
-
-### Remembered View choices
-
-`edit` remembers the last choice for **View > Word Wrap** (Alt+Z) and **View > Spell Check**:
-- Word wrap: every document you open starts with word wrap on or off, as you last set it.
-  (Alt+Z still switches only the current document.)
-- Spell check: `edit` starts with it on or off, as you last set it. A `"spellcheck.enabled"` in
-  `settings.json` wins over the remembered choice.
-
-They're saved in `view-state.json`, next to `settings.json` (see below), whenever you change one.
-`edit` writes that file itself and never changes `settings.json`. Delete it to forget both choices.
+**View > Spell Check** turns spell checking on or off, and `edit` starts that way next time, unless
+`settings.json` sets `"spellcheck.enabled"` (see [Remembered View choices](FORK.md#remembered-view-choices)).
+While it's off, the shortcuts do nothing and the Edit menu item is hidden. A right-click still moves
+the cursor and gives the document the focus.
 
 ## Settings
 

@@ -132,6 +132,11 @@ impl DocumentManager {
         self.list.len()
     }
 
+    // Fork: reopen files. All documents, oldest first. The last one is the active one.
+    pub fn iter(&self) -> impl Iterator<Item = &Document> {
+        self.list.iter()
+    }
+
     #[inline]
     pub fn active(&self) -> Option<&Document> {
         self.list.last()

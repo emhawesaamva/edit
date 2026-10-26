@@ -2213,3 +2213,9 @@ en = "Loading dictionary…"
 # Shown in the suggestions popup if the dictionary failed to load
 [SpellUnavailable]
 en = "Spell check unavailable"
+
+# Fork: reopen files (not part of upstream microsoft/edit). English only.
+
+# File menu checkbox: when it's on, starting edit without files reopens the files that were open last time
+[FileReopenFiles]
+en = "Reopen Files at Startup"

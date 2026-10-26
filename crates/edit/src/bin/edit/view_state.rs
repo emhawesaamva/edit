@@ -1,7 +1,8 @@
 // Licensed under the MIT License.
 // Fork-only: remembers View menu choices (not part of upstream microsoft/edit).
 
-//! Remembers the View menu's Word Wrap and Spell Check choices between sessions.
+//! Remembers the View menu's Word Wrap and Spell Check choices, and File > Reopen Files at
+//! Startup, between sessions.
 //!
 //! They're kept in `view-state.json` next to settings.json, which `edit` rewrites whenever one of
 //! them is toggled. settings.json itself is never written, because it may hold the user's comments.
@@ -32,6 +33,15 @@ pub fn spell_check() -> Option<bool> {
     lock().state.spell_check
 }
 
+/// Whether File > Reopen Files at Startup is on.
+pub fn reopen_files() -> bool {
+    lock().state.reopen_files.unwrap_or(false)
+}
+
+pub fn set_reopen_files(on: bool) {
+    lock().update(|s| s.reopen_files = Some(on));
+}
+
 pub fn set_word_wrap(on: bool) {
     lock().update(|s| s.word_wrap = Some(on));
 }
@@ -48,6 +58,7 @@ fn lock() -> MutexGuard<'static, Store> {
 struct ViewState {
     word_wrap: Option<bool>,
     spell_check: Option<bool>,
+    reopen_files: Option<bool>,
 }
 
 struct Store {
@@ -58,7 +69,10 @@ struct Store {
 
 impl Store {
     const fn new() -> Self {
-        Self { path: None, state: ViewState { word_wrap: None, spell_check: None } }
+        Self {
+            path: None,
+            state: ViewState { word_wrap: None, spell_check: None, reopen_files: None },
+        }
     }
 
     fn load(&mut self, settings_path: &Path) {
@@ -90,14 +104,22 @@ fn parse(text: &str) -> ViewState {
     let Some(root) = json::parse(&scratch, text).ok().and_then(|v| v.as_object()) else {
         return ViewState::default();
     };
-    ViewState { word_wrap: root.get_bool("wordWrap"), spell_check: root.get_bool("spellCheck") }
+    ViewState {
+        word_wrap: root.get_bool("wordWrap"),
+        spell_check: root.get_bool("spellCheck"),
+        reopen_files: root.get_bool("reopenFiles"),
+    }
 }
 
 fn serialize(state: &ViewState) -> String {
-    let entries: Vec<_> = [("wordWrap", state.word_wrap), ("spellCheck", state.spell_check)]
-        .into_iter()
-        .filter_map(|(key, value)| Some((key, value?)))
-        .collect();
+    let entries: Vec<_> = [
+        ("wordWrap", state.word_wrap),
+        ("spellCheck", state.spell_check),
+        ("reopenFiles", state.reopen_files),
+    ]
+    .into_iter()
+    .filter_map(|(key, value)| Some((key, value?)))
+    .collect();
     let mut out = String::from("{\n");
     for (i, (key, value)) in entries.iter().enumerate() {
         let comma = if i + 1 < entries.len() { "," } else { "" };
@@ -145,7 +167,8 @@ mod tests {
 
     #[test]
     fn test_parse() {
-        let on_off = ViewState { word_wrap: Some(true), spell_check: Some(false) };
+        let on_off =
+            ViewState { word_wrap: Some(true), spell_check: Some(false), reopen_files: None };
         assert_eq!(parse(r#"{ "wordWrap": true, "spellCheck": false }"#), on_off);
         assert_eq!(
             parse("{\n// A comment.\n\"wordWrap\": true, \"spellCheck\": false,\n}"),
@@ -153,7 +176,7 @@ mod tests {
         );
         assert_eq!(
             parse(r#"{ "spellCheck": true }"#),
-            ViewState { word_wrap: None, spell_check: Some(true) }
+            ViewState { word_wrap: None, spell_check: Some(true), reopen_files: None }
         );
         // Anything else is ignored.
         for text in ["", "{", "[]", "true", r#"{ "wordWrap": "on", "spellCheck": 1 }"#] {
@@ -164,14 +187,18 @@ mod tests {
     #[test]
     fn test_serialize() {
         assert_eq!(serialize(&ViewState::default()), "{\n}\n");
-        let state = ViewState { word_wrap: Some(true), spell_check: Some(false) };
+        let state = ViewState { word_wrap: None, spell_check: None, reopen_files: Some(true) };
+        assert_eq!(serialize(&state), "{\n    \"reopenFiles\": true\n}\n");
+        assert_eq!(parse(&serialize(&state)), state);
+        let state =
+            ViewState { word_wrap: Some(true), spell_check: Some(false), reopen_files: None };
         assert_eq!(serialize(&state), "{\n    \"wordWrap\": true,\n    \"spellCheck\": false\n}\n");
-        let state = ViewState { word_wrap: None, spell_check: Some(true) };
+        let state = ViewState { word_wrap: None, spell_check: Some(true), reopen_files: None };
         assert_eq!(serialize(&state), "{\n    \"spellCheck\": true\n}\n");
         for state in [
             ViewState::default(),
-            ViewState { word_wrap: Some(false), spell_check: None },
-            ViewState { word_wrap: Some(true), spell_check: Some(true) },
+            ViewState { word_wrap: Some(false), spell_check: None, reopen_files: None },
+            ViewState { word_wrap: Some(true), spell_check: Some(true), reopen_files: None },
         ] {
             assert_eq!(parse(&serialize(&state)), state);
         }
@@ -196,11 +223,17 @@ mod tests {
 
         let mut next = Store::new();
         next.load(&settings);
-        assert_eq!(next.state, ViewState { word_wrap: Some(true), spell_check: Some(false) });
+        assert_eq!(
+            next.state,
+            ViewState { word_wrap: Some(true), spell_check: Some(false), reopen_files: None }
+        );
         next.update(|s| s.word_wrap = Some(false));
         let mut last = Store::new();
         last.load(&settings);
-        assert_eq!(last.state, ViewState { word_wrap: Some(false), spell_check: Some(false) });
+        assert_eq!(
+            last.state,
+            ViewState { word_wrap: Some(false), spell_check: Some(false), reopen_files: None }
+        );
     }
 
     // Without a settings directory, nothing is written anywhere.

@@ -74,6 +74,11 @@ fn draw_menu_file(ctx: &mut Context, state: &mut State) {
     {
         state.wants_close = true;
     }
+    // Fork: reopen files
+    let reopen = crate::view_state::reopen_files();
+    if ctx.menubar_menu_checkbox(loc(LocId::FileReopenFiles), 'R', vk::NULL, reopen) {
+        crate::session::set_enabled(&state.documents, !reopen);
+    }
     if ctx.menubar_menu_button(loc(LocId::FileExit), 'X', kbmod::CTRL | vk::Q) {
         state.wants_exit = true;
     }
