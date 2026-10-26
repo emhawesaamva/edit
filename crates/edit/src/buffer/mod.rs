@@ -1263,6 +1263,10 @@ impl TextBuffer {
 
         self.edit_begin_grouping();
         while let Some(range) = self.find_select_next(&mut search, offset, false) {
+            // Fork: upstream bug, Replace All loops when the last match ends at EOF
+            if range.start < offset {
+                break;
+            }
             let replacement =
                 self.find_fill_replacement(&mut search, replacement, &parsed_replacements);
 

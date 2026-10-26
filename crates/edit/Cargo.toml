@@ -25,6 +25,8 @@ single-threaded = []
 lsh = { path = "../lsh", version = "0.1", default-features = false, features = ["compiler", "glob"] }
 # Fork: spellcheck. Hunspell-compatible spell checker (MPL-2.0).
 spellbook = "0.4.2"
+# Fork: spellcheck. Its fixed-seed hasher keeps the order of spellbook's suggestions stable (Zlib).
+foldhash = { version = "0.2", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
