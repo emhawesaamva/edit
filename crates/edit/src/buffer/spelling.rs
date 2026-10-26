@@ -893,6 +893,198 @@ A paragraph that is hard wrapped
     }
 
     #[test]
+    fn test_collect_markdown_list_fences() {
+        let _g = shared_globals();
+        // A fence on a list marker line used to be prose. Its closing fence then opened a fence,
+        // which skipped prose until the next fence line, and checked the code after that.
+        let doc = "\
+# Setup
+
+1. ```bash
+   npm install
+   ```
+2. Run teh build.
+
+## Usage
+
+```
+tool --flag
+```
+
+Then check the wrod output.
+
+```
+baz qux
+```
+
+More speling here.
+";
+        let expected = [(5, "teh"), (13, "wrod"), (19, "speling")];
+        let mut tb = buffer(Some("markdown"), doc);
+        assert_every_window(&mut tb, &expected);
+
+        let doc = "Intro.\n\n- ```sh\n  npm install\n  ```\n- Then teh step.\n\nAfter wrod.\n";
+        let mut tb = buffer(Some("markdown"), doc);
+        assert_every_window(&mut tb, &[(5, "teh"), (7, "wrod")]);
+
+        let doc = "+ ```\n  code wierd\n  ```\n\nAfter teh.\n";
+        let mut tb = buffer(Some("markdown"), doc);
+        assert_every_window(&mut tb, &[(4, "teh")]);
+
+        // A fence opened inside an item is closed relative to the item's text.
+        let doc = "- Step one:\n   ```sh\n    echo wierd\n    ```\nThen teh prose.\n";
+        let mut tb = buffer(Some("markdown"), doc);
+        assert_every_window(&mut tb, &[(4, "teh")]);
+
+        // And in a nested item, indented by 4.
+        let doc = "- a\n  - b\n    ```sh\n    echo wierd\n    ```\n  - c teh\n";
+        let mut tb = buffer(Some("markdown"), doc);
+        assert_every_window(&mut tb, &[(5, "teh")]);
+    }
+
+    #[test]
+    fn test_collect_markdown_list_continuation() {
+        let _g = shared_globals();
+        // Paragraphs in list items after a blank line used to be indented code.
+        let doc = "\
+- First item
+
+    Continuation paragraph with teh typo.
+
+    - nested item with wrod
+
+Back to top level speling.
+
+1. Open the portal.
+
+    Then recieve the key.
+
+- item
+
+\tTab continuation with acheive.
+
+- a
+  - b
+
+  more a text
+
+    continuation with freind
+
+- item
+
+      code wierd
+
+After coment.
+";
+        let expected = [
+            (2, "teh"),
+            (4, "wrod"),
+            (6, "speling"),
+            (10, "recieve"),
+            (14, "acheive"),
+            (21, "freind"),
+            (27, "coment"),
+        ];
+        let mut tb = buffer(Some("markdown"), doc);
+        assert_every_window(&mut tb, &expected);
+    }
+
+    #[test]
+    fn test_collect_markdown_front_matter() {
+        let _g = shared_globals();
+        // Obsidian notes, Jekyll pages, etc.
+        let doc = "\
+---
+tags: [mispeled, wierd]
+aliases:
+  - Teh Alias
+---
+# A title with wrod
+
+Body with speling.
+";
+        let mut tb = buffer(Some("markdown"), doc);
+        assert_every_window(&mut tb, &[(5, "wrod"), (7, "speling")]);
+
+        // A thematic break at the start isn't front matter.
+        let doc = "---\n\nIntro wrod after a rule.\n\n---\n\nMore teh.\n";
+        let mut tb = buffer(Some("markdown"), doc);
+        assert_every_window(&mut tb, &[(2, "wrod"), (6, "teh")]);
+
+        // Front matter that's never closed ends at the first line that can't be YAML.
+        let doc = "---\ntitle: wierd\nSome intro with teh.\n";
+        let mut tb = buffer(Some("markdown"), doc);
+        assert_every_window(&mut tb, &[(2, "teh")]);
+
+        // Longer than the distance between two checkpoints.
+        let mut doc = "---\n".to_string();
+        for i in 0..3 * MARKDOWN_INTERVAL {
+            doc.push_str(&format!("key{i}: wierd\n"));
+        }
+        doc.push_str("...\nBody with teh.\n");
+        let mut tb = buffer(Some("markdown"), &doc);
+        assert_every_window(&mut tb, &[(3 * MARKDOWN_INTERVAL + 2, "teh")]);
+    }
+
+    #[test]
+    fn test_collect_markdown_list_edits() {
+        let _g = shared_globals();
+        // Front matter and lists across several checkpoints. The list column and front matter
+        // state are part of each checkpoint, and edits must invalidate them like any other state.
+        let mut doc = "---\n".to_string();
+        for i in 0..MARKDOWN_INTERVAL + 4 {
+            doc.push_str(&format!("key{i}: wierd\n"));
+        }
+        doc.push_str("---\n");
+        for _ in 0..4 {
+            doc.push_str("1. ```sh\n   wierd code\n   ```\n2. Run teh step.\n\n");
+            doc.push_str("    Continuation teh.\n\n    - nested teh\n      ```\n      wierd\n");
+            doc.push_str("      ```\n\n      More teh.\n\n");
+        }
+        let mut tb = buffer(Some("markdown"), &doc);
+        let original = assert_like_fresh(&mut tb);
+        assert_eq!(original.len(), 16);
+        assert!(original.iter().all(|(_, w)| w == "teh"), "{original:?}");
+
+        // Removing the front matter's opening line checks its lines.
+        tb.cursor_move_to_offset(0);
+        tb.delete(CursorMovement::Grapheme, 4);
+        let without = assert_like_fresh(&mut tb);
+        assert_eq!(
+            without.iter().filter(|(_, w)| w == "wierd").count(),
+            MARKDOWN_INTERVAL as usize + 4
+        );
+        tb.undo();
+        assert_eq!(assert_like_fresh(&mut tb), original);
+
+        // Unindenting the last list item's continuation (far below the first checkpoint)
+        // ends the list, so the nested item's fence below it isn't one anymore.
+        let lines: Vec<_> = doc.lines().collect();
+        let y = lines.iter().rposition(|&l| l == "    Continuation teh.").unwrap() as CoordType;
+        tb.cursor_move_to_logical(Point { x: 0, y });
+        tb.delete(CursorMovement::Grapheme, 4);
+        let unindented = assert_like_fresh(&mut tb);
+        assert_eq!(unindented.last(), Some(&(y + 4, "wierd".to_string())));
+        tb.undo();
+        assert_eq!(assert_like_fresh(&mut tb), original);
+
+        // Removing the first item's fence makes its code prose.
+        // (The fence that its closing line opens ends at the next item.)
+        let y = MARKDOWN_INTERVAL + 6;
+        tb.cursor_move_to_logical(Point { x: 3, y });
+        tb.delete(CursorMovement::Grapheme, 3);
+        let removed = assert_like_fresh(&mut tb);
+        assert_eq!(removed[0], (y + 1, "wierd".to_string()));
+        assert_eq!(removed[1..], original);
+        tb.undo();
+        assert_eq!(assert_like_fresh(&mut tb), original);
+        tb.redo();
+        assert_eq!(assert_like_fresh(&mut tb), removed);
+        tb.undo();
+        assert_eq!(assert_like_fresh(&mut tb), original);
+    }
+
+    #[test]
     fn test_collect_git_commit() {
         let _g = shared_globals();
         let doc = "\
