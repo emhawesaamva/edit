@@ -237,7 +237,8 @@ impl Scope {
 /// start of a line and after a list marker (not after `>`). Their indentation is measured from the
 /// content column of the list item they're in, but only the innermost item's column is known.
 /// A line that's indented less than that (and doesn't continue a paragraph) measures from its own
-/// indentation instead. Also, anything that isn't blank or code counts as paragraph text
+/// indentation instead. That's only an upper bound, so a fence there measures from the lowest
+/// column its indentation allows. Also, anything that isn't blank or code counts as paragraph text
 /// (headings, too).
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct MarkdownState {
@@ -249,6 +250,9 @@ pub struct MarkdownState {
     block: Block,
     /// The content column of the list item we're in (the indentation of its text), or 0.
     list: usize,
+    /// Whether `list` came from a list marker. After a line that's indented less,
+    /// it's only an upper bound.
+    exact: bool,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
@@ -270,7 +274,8 @@ struct Fence {
     ch: u8,
     /// The length of the opening fence. The closing one must be at least as long.
     len: usize,
-    /// The column the closing fence's indentation is measured from (the list item's content column).
+    /// The column the closing fence's indentation is measured from (the list item's content column,
+    /// or the lowest it can be if that isn't known exactly). A line indented less ends the block.
     base: usize,
 }
 
@@ -353,6 +358,7 @@ impl MarkdownState {
                 return false;
             }
             self.list = indent + width;
+            self.exact = true;
             // `- ```sh`: A fence right after the list marker.
             if let Some((ch, len)) = fence_open(&rest[width..]) {
                 self.fence = Some(Fence { ch, len, base: self.list });
@@ -372,9 +378,15 @@ impl MarkdownState {
                 || is_thematic_break(rest))
         {
             self.list = indent;
+            self.exact = false;
         }
         if let Some((ch, len)) = fence {
-            self.fence = Some(Fence { ch, len, base: self.list });
+            // Without an exact column, the fence may be in an outer item or top-level (like one
+            // indented by 2 after `1. `), where its content can be indented less, and its closing
+            // fence more. A fence is indented at most 3 more than its item's text, so measuring
+            // from there neither ends nor closes the block too early.
+            let base = if self.exact { self.list } else { indent.saturating_sub(3) };
+            self.fence = Some(Fence { ch, len, base });
             return true;
         }
 
@@ -1213,9 +1225,84 @@ End.
         // A line that's indented less than the item's text ends the item and its fence.
         let doc = "- ```sh\n  echo hi\n- Next item.\n\nMore prose.\n";
         assert_eq!(markdown_prose(doc), ["- Next item.", "More prose."]);
+        let doc = "- Install:\n\n  ```sh\nnpm ci\n  ```\n\nAfter teh.\n";
+        assert_eq!(markdown_prose(doc), ["- Install:", "npm ci"]);
         // But a closing fence closes it.
         let doc = "1. Run:\n   ```sh\n   npm ci\n```\n2. Next.\n";
         assert_eq!(markdown_prose(doc), ["1. Run:", "2. Next."]);
+
+        // A fence that's indented less than the item's text isn't in the item. It may be top-level,
+        // where its content can have any indentation. Content at column 0 used to end it, and its
+        // closing fence then opened another one, which hid the rest of the file.
+        let doc = "\
+1. Create the config file:
+
+  ```yaml
+name: tset
+on: push
+  ```
+
+2. Commit teh file.
+
+More prose with wrod.
+";
+        assert_eq!(
+            markdown_prose(doc),
+            ["1. Create the config file:", "2. Commit teh file.", "More prose with wrod."]
+        );
+        let doc = "\
+1. Step one
+2. Step two
+
+ ```
+cat <<EOF > fiel.txt
+EOF
+ ```
+
+Prose teh.
+";
+        assert_eq!(markdown_prose(doc), ["1. Step one", "2. Step two", "Prose teh."]);
+        let doc = "1. Run:\n  ```sh\nnpm ci\n  ```\nAfter teh.\n";
+        assert_eq!(markdown_prose(doc), ["1. Run:", "After teh."]);
+        // The same after a paragraph that's indented less than the item's text.
+        let doc = "\
+1. Step
+
+  Explanation here.
+  ```sh
+cat <<EOF
+hello wrld
+EOF
+  ```
+
+Prose teh.
+";
+        assert_eq!(markdown_prose(doc), ["1. Step", "  Explanation here.", "Prose teh."]);
+        // Its closing fence can't be indented 4 or more, although the guessed column is 2.
+        let doc = "1. Step\n\n  ```\n  code\n     ```\n  still code\n  ```\n\nAfter teh.\n";
+        assert_eq!(markdown_prose(doc), ["1. Step", "After teh."]);
+        // But after a nested item, a fence indented by 4 or more is in an outer item, which has its
+        // text 3 columns before the fence at most. So it closes at its own indentation, and a line
+        // indented less than that column ends it.
+        let doc = "\
+- Defines a variable:
+
+    - Unadorned: the history.
+
+    ```console
+    irb> foo
+    ```
+
+    Note teh output.
+";
+        assert_eq!(
+            markdown_prose(doc),
+            ["- Defines a variable:", "    - Unadorned: the history.", "    Note teh output."]
+        );
+        let doc = "- a\n  - b\n\n  para\n     ```\n     code\n     ```\n\nAfter teh.\n";
+        assert_eq!(markdown_prose(doc), ["- a", "  - b", "  para", "After teh."]);
+        let doc = "- a\n  - b\n    - c\n\n    ```sh\n    code\nAfter teh.\n";
+        assert_eq!(markdown_prose(doc), ["- a", "  - b", "    - c", "After teh."]);
 
         // Not fences.
         let doc = "- ```code``` and text\n\nAfter.\n";

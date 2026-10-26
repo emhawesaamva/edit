@@ -940,6 +940,68 @@ More speling here.
         let doc = "- a\n  - b\n    ```sh\n    echo wierd\n    ```\n  - c teh\n";
         let mut tb = buffer(Some("markdown"), doc);
         assert_every_window(&mut tb, &[(5, "teh")]);
+
+        // A fence that's indented less than the item's text may be top-level. Its content at
+        // column 0 used to be prose, and its closing fence then hid the rest of the file.
+        let doc = "\
+1. Create the settings file:
+
+  ```yaml
+name: wierd
+on: push
+  ```
+
+2. Commit teh file.
+
+More prose with wrod.
+";
+        let mut tb = buffer(Some("markdown"), doc);
+        assert_every_window(&mut tb, &[(7, "teh"), (9, "wrod")]);
+        let doc = "\
+1. Step one
+2. Step two
+
+ ```
+cat <<EOF > notes.txt
+wierd text
+EOF
+ ```
+
+Prose with teh typo.
+";
+        let mut tb = buffer(Some("markdown"), doc);
+        assert_every_window(&mut tb, &[(9, "teh")]);
+        let doc = "\
+1. Step
+
+  Explanation here.
+  ```sh
+cat <<EOF
+hello wierd
+EOF
+  ```
+
+Prose teh.
+";
+        let mut tb = buffer(Some("markdown"), doc);
+        assert_every_window(&mut tb, &[(9, "teh")]);
+        let doc = "1. Step\n\n  ```\n  code wierd\n     ```\n  still untill\n  ```\n\nAfter teh.\n";
+        let mut tb = buffer(Some("markdown"), doc);
+        assert_every_window(&mut tb, &[(8, "teh")]);
+        // After a nested item, a fence that's indented by 4 still closes at its own indentation.
+        let doc = "\
+- Defines a variable:
+
+    - Unadorned: shows the history.
+
+    ```console
+    irb> wierd
+    ```
+
+    Note teh output.
+";
+        let mut tb = buffer(Some("markdown"), doc);
+        assert_every_window(&mut tb, &[(8, "teh")]);
     }
 
     #[test]
@@ -1082,6 +1144,85 @@ Body with speling.
         assert_eq!(assert_like_fresh(&mut tb), removed);
         tb.undo();
         assert_eq!(assert_like_fresh(&mut tb), original);
+    }
+
+    /// Asserts that each Markdown checkpoint holds the offset and the entire state that feeding
+    /// the lines before it to a fresh [`MarkdownState`] gives.
+    fn assert_checkpoints_match(tb: &TextBuffer) {
+        let text = contents(tb);
+        let mut lines = text.split_inclusive('\n');
+        let mut md = MarkdownState::default();
+        let mut offset = 0;
+        for (i, &checkpoint) in tb.spell.markdown.states.iter().enumerate() {
+            let skip = if i == 0 { 0 } else { MARKDOWN_INTERVAL as usize };
+            for line in lines.by_ref().take(skip) {
+                md.next_line(line.strip_suffix('\n').unwrap_or(line).as_bytes());
+                offset += line.len();
+            }
+            assert_eq!(checkpoint, (offset, md), "checkpoint {i}");
+        }
+    }
+
+    #[test]
+    fn test_collect_markdown_fence_edits() {
+        let _g = shared_globals();
+        // Fences after a line that's indented less than the item's text, which only gives an upper
+        // bound for the item's text column. In the middle, the paragraph with that guess and the
+        // fence's content at column 0 are both longer than the distance between two checkpoints.
+        let interval = MARKDOWN_INTERVAL as usize;
+        let short = "1. Step\n\n  ```sh\ncat <<EOF\nEOF\n  ```\n\nShort teh.\n\n";
+        let mut doc = short.to_string();
+        doc.push_str("1. Step one\n\n  Explanation here.\n");
+        doc.push_str(&"  More explanation.\n".repeat(interval));
+        doc.push_str("  ```sh\ncat <<EOF\nhello wierd\n");
+        doc.push_str(&"echo hello\n".repeat(interval));
+        doc.push_str("EOF\n  ```\n\nProse teh.\n\n- Install:\n\n  ```sh\n  npm ci wierd\n");
+        doc.push_str("  ```\n\nAfter teh.\n\n");
+        doc.push_str(short);
+        let lines: Vec<_> = doc.lines().collect();
+        let line_of = |text: &str| lines.iter().position(|&l| l == text).unwrap() as CoordType;
+        let mut tb = buffer(Some("markdown"), &doc);
+        let original = assert_like_fresh(&mut tb);
+        assert_checkpoints_match(&tb);
+        let teh: Vec<_> = (0..lines.len())
+            .filter(|&y| lines[y].ends_with(" teh."))
+            .map(|y| (y as CoordType, "teh".to_string()))
+            .collect();
+        assert_eq!(original, teh);
+
+        // `- ` instead of `1. ` puts the middle item's text at column 2, exactly. Its explanation
+        // and fence are in the item then, and the fence's content at column 0 ends both.
+        let y = line_of("1. Step one");
+        tb.cursor_move_to_logical(Point { x: 0, y });
+        tb.selection_update_logical(Point { x: 2, y });
+        tb.write_raw(b"-");
+        let exact = assert_like_fresh(&mut tb);
+        assert_checkpoints_match(&tb);
+        assert!(exact.contains(&(line_of("hello wierd"), "wierd".to_string())), "{exact:?}");
+        assert!(!exact.contains(&(line_of("Prose teh."), "teh".to_string())), "{exact:?}");
+        tb.undo();
+        assert_eq!(assert_like_fresh(&mut tb), original);
+        tb.redo();
+        assert_eq!(assert_like_fresh(&mut tb), exact);
+        tb.undo();
+        assert_eq!(assert_like_fresh(&mut tb), original);
+
+        // A list item pasted into the explanation, right below a checkpoint inside it
+        // (which the edit keeps), does the same for the rest of the explanation.
+        let y = (line_of("  Explanation here.") as usize).next_multiple_of(interval) + 1;
+        tb.cursor_move_to_logical(Point { x: 0, y: y as CoordType });
+        tb.write_raw(b"\n- Note:\n");
+        let pasted = assert_like_fresh(&mut tb);
+        assert_checkpoints_match(&tb);
+        let y = line_of("hello wierd") + 2;
+        assert!(pasted.contains(&(y, "wierd".to_string())), "{pasted:?}");
+        tb.undo();
+        assert_eq!(assert_like_fresh(&mut tb), original);
+        tb.redo();
+        assert_eq!(assert_like_fresh(&mut tb), pasted);
+        tb.undo();
+        assert_eq!(assert_like_fresh(&mut tb), original);
+        assert_checkpoints_match(&tb);
     }
 
     #[test]
