@@ -9,31 +9,34 @@
 //! * Every range is valid UTF-8 and at most [`super::MAX_WORD_LEN`] bytes long,
 //!   so callers may use `str::from_utf8_unchecked(&text[range])`.
 //!
-//! The rules, in order. "Code strings" means [`TextKind::CodeString`] and
-//! [`TextKind::VerbatimString`].
+//! The rules, in order. "Code strings" means [`TextKind::CodeString`],
+//! [`TextKind::VerbatimString`] and [`TextKind::SqlString`], "verbatim strings" the last two.
 //! 1. Masks: code spans (a run of backticks through the next run of equally many) and
 //!    HTML/XML tags (`<` plus an ASCII letter, `/` or `!`, through the next `>`) are never
 //!    checked. Unmatched backticks and `<` are punctuation. Code spans and tags separate runs
-//!    like whitespace does. In a [`TextKind::VerbatimString`], a backtick is an escape
-//!    (rule 3), never a code span.
+//!    like whitespace does. In a [`TextKind::VerbatimString`], a backtick is an escape or
+//!    punctuation (rule 3), never a code span.
 //! 2. Runs: whole runs between whitespace that look like URLs, email addresses, paths
 //!    (`C:\Users`, `C:/Users`) or file names are skipped (see `is_skipped_run`). Outside a
 //!    [`TextKind::CodeString`] that includes every run with `\` plus an ASCII letter or digit:
 //!    paths without a drive, registry keys, LaTeX commands.
 //! 3. Masks within a run: HTML entities (`&nbsp;`, `&#8212;`) are never checked. In a
 //!    [`TextKind::CodeString`], neither are escapes (`\n`, `\x41`, `\u{41}`). In a
-//!    [`TextKind::VerbatimString`], neither are PowerShell escapes (`` `n ``, `` `$ ``). In code
+//!    [`TextKind::VerbatimString`], neither are PowerShell escapes: a backtick plus ASCII
+//!    punctuation or one of the case-sensitive `0abefnrtuv` (`` `n ``, `` `$ ``). Before any
+//!    other letter or digit, a backtick is punctuation (`` `Get-Help` `` keeps `Get`). In code
 //!    strings, neither are printf specs that end at a word boundary (`%lu`, `%(name)s`) and format
 //!    placeholders without whitespace (`{}`, `{0}`, `{name:>8}`). These masks stay part of their
 //!    run, so that `C:\Users` is still recognized as a path.
 //! 4. Words: letters, combining marks, ASCII digits and `_`, plus apostrophes between two letters.
-//!    Leading and trailing `_` are stripped (Markdown's `_italic_`). In a
-//!    [`TextKind::VerbatimString`], an `N'` or `n'` at the start of the segment is T-SQL's Unicode
-//!    prefix (`N'Hello'`), so the `N` doesn't join the word after it.
-//! 5. Words with an escaped apostrophe (`isn\'t`, and `isn''t` in a [`TextKind::VerbatimString`])
-//!    are skipped as a whole, because a replacement would lose the escape. So are variables in code
-//!    strings: words directly after a `$` (`$user`), and in a [`TextKind::VerbatimString`] also the
-//!    name after `$scope:` (PowerShell's `$env:windir`).
+//!    Leading and trailing `_` are stripped (Markdown's `_italic_`). In verbatim strings, an `N'`
+//!    or `n'` at the start of the segment is T-SQL's Unicode prefix (`N'Hello'`), so the `N`
+//!    doesn't join the word after it.
+//! 5. Words with an escaped apostrophe (`isn\'t`, and `isn''t` in verbatim strings) are skipped as
+//!    a whole, because a replacement would lose the escape. So are variables in code strings: words
+//!    directly after a `$` (`$user`) or after a `${` that doesn't start a placeholder
+//!    (`${env:ProgramFiles(x86)}`), and in verbatim strings also the name after `$scope:`
+//!    (PowerShell's `$env:windir`).
 //! 6. Words with digits, an internal `_`, camelCase, ALL CAPS (also with a plural `s` or `'s`),
 //!    non-Latin letters, byte or char literals and letter plurals (`b'a'`, `i's`), fewer than
 //!    2 characters or more than [`super::MAX_WORD_LEN`] bytes are skipped as a whole.
@@ -55,21 +58,21 @@ pub enum TextKind {
     /// A string literal in code: `\n`, `\x41`, `\u{...}`, `\'` are escape sequences,
     /// `%lu` is a printf spec, `{name}` is a format placeholder and `$user` is a variable.
     CodeString,
-    /// A string literal in a language whose strings don't use `\` escapes (PowerShell, SQL):
+    /// A string literal in a language whose strings don't use `\` escapes (PowerShell):
     /// `\` is part of a path like in prose, but `%ld` is still a printf spec, `''` is an escaped
     /// apostrophe, `` `n `` is a PowerShell escape and `N'...'` is a T-SQL Unicode string.
     /// Placeholders and variables are read like in a [`TextKind::CodeString`].
     VerbatimString,
     /// A SQL string literal: like a [`TextKind::VerbatimString`], except that a backtick
     /// is never an escape. It opens a code span (a MySQL quoted identifier) like in prose.
+    /// PowerShell's `$scope:name` still counts as a variable: it hardly occurs in SQL,
+    /// and a single difference keeps the two kinds easy to tell apart.
     SqlString,
 }
 
 /// Calls `f` with the byte range of every candidate word in `text`, reading it as `kind`.
 pub fn for_each_word_in(text: &[u8], kind: TextKind, mut f: impl FnMut(Range<usize>)) {
-    // SKELETON (round 3 fixes): read as verbatim until the tokenizer part implements it.
-    let kind = if kind == TextKind::SqlString { TextKind::VerbatimString } else { kind };
-    let verbatim = kind == TextKind::VerbatimString;
+    let backtick_escapes = kind == TextKind::VerbatimString;
     let len = text.len();
     // Start of the current run.
     let mut run_beg = 0;
@@ -87,10 +90,11 @@ pub fn for_each_word_in(text: &[u8], kind: TextKind, mut f: impl FnMut(Range<usi
 
         let separates = match b {
             b' ' | b'\t' | b'\n' | b'\r' | b'\x0b' | b'\x0c' => true,
-            // In a verbatim string, a backtick is PowerShell's escape character.
-            b'\\' | b'`' if b == b'\\' || verbatim => {
+            // In a PowerShell string, a backtick is the escape character.
+            b'\\' | b'`' if b == b'\\' || backtick_escapes => {
                 // The escaped character can't open a mask (Markdown's \` and \<, PowerShell's `<).
-                // The escape itself is masked by `for_each_word_in_run`.
+                // The escape itself is masked by `for_each_word_in_run`. A backtick before a
+                // letter or digit may be punctuation there instead, but those can't open a mask.
                 if i < len && text[i].is_ascii_graphic() {
                     i += 1;
                 }
@@ -221,10 +225,15 @@ fn is_skipped_run(run: &[u8], kind: TextKind) -> bool {
     let mut prev3 = ' ';
     let mut prev2 = ' ';
     let mut prev = ' ';
+    // Whether `prev`, `prev2` and `prev3` are a `%` or the flags, width, precision or position
+    // after one. Only then are they part of a printf spec: the `*` in `*C:/Temp*` is emphasis.
+    let mut spec3 = false;
+    let mut spec2 = false;
+    let mut spec = false;
     for c in Utf8Chars::new(run, 0) {
-        // C: or c:, but not Error: or the printf spec in "%s:".
+        // C: or c:, but not Error: or the printf specs in "%s:" and "%-s:".
         let after_drive =
-            prev == ':' && prev2.is_ascii_alphabetic() && !prev3.is_alphanumeric() && prev3 != '%';
+            prev == ':' && prev2.is_ascii_alphabetic() && !prev3.is_alphanumeric() && !spec3;
         let skip = match c {
             '@' => true,
             // https://, C:/Users
@@ -239,6 +248,9 @@ fn is_skipped_run(run: &[u8], kind: TextKind) -> bool {
         if skip {
             return true;
         }
+        spec3 = spec2;
+        spec2 = spec;
+        spec = c == '%' || (spec && matches!(c, '-' | '+' | '#' | '*' | '.' | '$' | '0'..='9'));
         prev3 = prev2;
         prev2 = prev;
         prev = c;
@@ -259,7 +271,8 @@ fn for_each_word_in_run(
     }
 
     let code = kind != TextKind::Prose;
-    let verbatim = kind == TextKind::VerbatimString;
+    let verbatim = matches!(kind, TextKind::VerbatimString | TextKind::SqlString);
+    let backtick_escapes = kind == TextKind::VerbatimString;
     let text = &text[..run.end];
     let mut chars = Utf8Chars::new(text, run.start);
     let mut word_beg = None;
@@ -277,6 +290,8 @@ fn for_each_word_in_run(
         let Some(c) = chars.next() else {
             break;
         };
+        // Whether `c` is a `{` after a `$` that doesn't start a placeholder.
+        let mut brace_after_dollar = false;
 
         let joins = if is_combining_mark(c) {
             true
@@ -311,9 +326,10 @@ fn for_each_word_in_run(
                     chars.seek(escape_end(text, pos));
                     false
                 }
-                // PowerShell's escapes: `n, `t, `$.
-                '`' if verbatim => {
-                    let escaped = text.get(pos + 1).is_some_and(u8::is_ascii_graphic);
+                // PowerShell's escapes: `n, `t, `$. Before another letter or digit, a backtick
+                // escapes nothing, so `Get-Help` in a message keeps its G.
+                '`' if backtick_escapes => {
+                    let escaped = text.get(pos + 1).is_some_and(|&b| is_powershell_escape(b));
                     chars.seek(pos + 1 + escaped as usize);
                     false
                 }
@@ -326,7 +342,10 @@ fn for_each_word_in_run(
                     false
                 }
                 '{' if code => {
-                    chars.seek(placeholder_end(text, pos));
+                    let end = placeholder_end(text, pos);
+                    // ${env:ProgramFiles(x86)} isn't a placeholder, but its name is a variable.
+                    brace_after_dollar = after_dollar && end == pos + 1;
+                    chars.seek(end);
                     false
                 }
                 _ => c.is_alphabetic() || c.is_ascii_digit() || c == '_',
@@ -335,7 +354,7 @@ fn for_each_word_in_run(
             joins
         };
 
-        let mut next_after_dollar = code && c == '$';
+        let mut next_after_dollar = code && (c == '$' || brace_after_dollar);
         match (joins, word_beg) {
             (true, None) => {
                 word_beg = Some(pos);
@@ -391,6 +410,14 @@ fn escape_end(text: &[u8], pos: usize) -> usize {
         Some(b) if b.is_ascii_alphabetic() => pos + 2,
         _ => pos + 1,
     }
+}
+
+/// Whether a backtick escapes `b` in a PowerShell string: ASCII punctuation (`` `$ ``, `` `" ``)
+/// and the case-sensitive escape characters `0abefnrtuv` (`` `n ``, `` `t ``, `` `u{2019} ``).
+/// Before anything else, such as the `G` in `` `Get-Help` ``, PowerShell ignores the backtick,
+/// so it's punctuation here.
+fn is_powershell_escape(b: u8) -> bool {
+    b.is_ascii_punctuation() || b"0abefnrtuv".contains(&b)
 }
 
 /// Returns the end of the HTML entity at `pos` (`&nbsp;`, `&#8212;`, `&#x2014;`),
@@ -532,16 +559,18 @@ fn is_checkable_word(word: &[u8], quote_after: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::TextKind::{CodeString, Prose, VerbatimString};
+    use super::TextKind::{CodeString, Prose, SqlString, VerbatimString};
     use super::*;
 
-    const KINDS: [TextKind; 3] = [Prose, CodeString, VerbatimString];
+    const KINDS: [TextKind; 4] = [Prose, CodeString, VerbatimString, SqlString];
     /// The kinds that read `%`, `{` and `$` as code.
-    const CODE: [TextKind; 2] = [CodeString, VerbatimString];
+    const CODE: [TextKind; 3] = [CodeString, VerbatimString, SqlString];
     /// The kinds that read `\` as part of a path.
-    const BACKSLASH_PATHS: [TextKind; 2] = [Prose, VerbatimString];
+    const BACKSLASH_PATHS: [TextKind; 3] = [Prose, VerbatimString, SqlString];
     /// The kinds that have code spans.
-    const BACKTICK_SPANS: [TextKind; 2] = [Prose, CodeString];
+    const BACKTICK_SPANS: [TextKind; 3] = [Prose, CodeString, SqlString];
+    /// The kinds that read `''`, `N'` and `$scope:` like PowerShell and SQL do.
+    const VERBATIM: [TextKind; 2] = [VerbatimString, SqlString];
 
     fn words_in(text: &[u8], kind: TextKind) -> Vec<&str> {
         let mut words = Vec::new();
@@ -576,6 +605,10 @@ mod tests {
     }
 
     fn check_verbatim(cases: &[(&str, &[&str])]) {
+        check_kinds(&VERBATIM, cases);
+    }
+
+    fn check_powershell(cases: &[(&str, &[&str])]) {
         check_in(VerbatimString, cases);
     }
 
@@ -585,8 +618,17 @@ mod tests {
         }
     }
 
+    /// Checks cases with the expected words for each of [`KINDS`], in that order.
+    fn check_each(cases: &[(&str, [&[&str]; 4])]) {
+        for &(text, expected) in cases {
+            for (kind, expected) in KINDS.into_iter().zip(expected) {
+                assert_eq!(words_in(text.as_bytes(), kind), expected, "{kind:?} {text:?}");
+            }
+        }
+    }
+
     /// Asserts the CONTRACT for every kind and returns the number of words for each.
-    fn check_contract(text: &[u8]) -> [usize; 3] {
+    fn check_contract(text: &[u8]) -> [usize; 4] {
         KINDS.map(|kind| check_contract_in(text, kind))
     }
 
@@ -663,7 +705,7 @@ mod tests {
 
     #[test]
     fn test_powershell_escapes() {
-        check_verbatim(&[
+        check_powershell(&[
             // A backtick escapes one character, and the escape separates words but not runs.
             ("Done.`nplease restart", &["Done", "please", "restart"]),
             ("Hello`nWorld teh`tdone", &["Hello", "World", "teh", "done"]),
@@ -672,13 +714,105 @@ mod tests {
             ("`nStarting deployment`r`n", &["Starting", "deployment"]),
             ("Say `\"hi`\" for `$5", &["Say", "hi", "for"]),
             ("Unicode `u{2019} quote", &["Unicode", "quote"]),
+            ("`0`a`b`e`f`n`r`t`v done", &["done"]),
+            ("`alert `bell `error `form `vert", &["lert", "ell", "rror", "orm", "ert"]),
+            // Before any other letter or digit, a backtick is punctuation. The letters are
+            // case-sensitive.
+            ("Run `Get-Help` for help", &["Run", "Get", "Help", "for", "help"]),
+            ("`Customers` and `Greetings frend", &["Customers", "and", "Greetings", "frend"]),
+            ("`Alert `Bell `Error `Form `Next", &["Alert", "Bell", "Error", "Form", "Next"]),
+            ("`1st place", &["place"]),
             // Never a code span.
             ("use `foo bar` here", &["use", "oo", "bar", "here"]),
+            ("use `code` here", &["use", "code", "here"]),
             ("``double`` ok", &["double", "ok"]),
             // An escaped character can't open a mask.
             // A backtick before whitespace escapes nothing.
             ("`<b>not a tag", &["not", "tag"]),
             ("tick` alone `", &["tick", "alone"]),
+            ("`\u{00E9}t\u{00E9} ok", &["\u{00E9}t\u{00E9}", "ok"]),
+        ]);
+    }
+
+    #[test]
+    fn test_backticks_per_kind() {
+        // Prose, CodeString, VerbatimString (PowerShell), SqlString. In SQL, a backtick is never an
+        // escape, so MySQL's quoted identifiers are code spans like in prose.
+        check_each(&[
+            (
+                "Run `Get-Help` for help",
+                [
+                    &["Run", "for", "help"],
+                    &["Run", "for", "help"],
+                    &["Run", "Get", "Help", "for", "help"],
+                    &["Run", "for", "help"],
+                ],
+            ),
+            ("`Customers`", [&[], &[], &["Customers"], &[]]),
+            (
+                "\"Customer `Naem`\"",
+                [&["Customer"], &["Customer"], &["Customer", "Naem"], &["Customer"]],
+            ),
+            (
+                "'Foreign key to `customers`.`id`, see `invoices`'",
+                [
+                    &["Foreign", "key", "to", "see"],
+                    &["Foreign", "key", "to", "see"],
+                    &["Foreign", "key", "to", "customers", "id", "see", "invoices"],
+                    &["Foreign", "key", "to", "see"],
+                ],
+            ),
+            // SELECT, FROM and WHERE are all caps.
+            (
+                "'SELECT * FROM `customers` WHERE `name` = ?'",
+                [&[], &[], &["customers", "ame"], &[]],
+            ),
+            // `t is PowerShell's tab.
+            (
+                "'Use `teh` table'",
+                [&["Use", "table"], &["Use", "table"], &["Use", "eh", "table"], &["Use", "table"]],
+            ),
+            // Continuation lines of multi-line strings.
+            (
+                "`id` AS row_id, `name` AS wrod, `email`",
+                [&["wrod"], &["wrod"], &["id", "ame", "wrod", "mail"], &["wrod"]],
+            ),
+            (
+                "`name` is teh `col`",
+                [&["is", "teh"], &["is", "teh"], &["ame", "is", "teh", "col"], &["is", "teh"]],
+            ),
+            (
+                "`Get-Report` creates teh report in `C:\\Reports`",
+                [
+                    &["creates", "teh", "report", "in"],
+                    &["creates", "teh", "report", "in"],
+                    &["Get", "Report", "creates", "teh", "report", "in"],
+                    &["creates", "teh", "report", "in"],
+                ],
+            ),
+            // Without a closing backtick, `n is an escape in PowerShell and punctuation plus a
+            // word too short to check elsewhere, so SQL doesn't check it either.
+            ("'escape `n wrod'", [&["escape", "wrod"]; 4]),
+            ("`Greetings frend", [&["Greetings", "frend"]; 4]),
+            (
+                "Done.`nplease restart",
+                [
+                    &["Done", "nplease", "restart"],
+                    &["Done", "nplease", "restart"],
+                    &["Done", "please", "restart"],
+                    &["Done", "nplease", "restart"],
+                ],
+            ),
+            // Only PowerShell escapes the `$`.
+            (
+                "`$price is literal",
+                [
+                    &["price", "is", "literal"],
+                    &["is", "literal"],
+                    &["price", "is", "literal"],
+                    &["is", "literal"],
+                ],
+            ),
         ]);
     }
 
@@ -803,6 +937,33 @@ mod tests {
     }
 
     #[test]
+    fn test_drive_paths_after_printf_flags() {
+        // Prose, CodeString, VerbatimString, SqlString. With flags, a width, a precision or a
+        // position, a printf spec isn't a drive letter either. Outside a CodeString, `:\` still
+        // makes a path, so the run is skipped there.
+        for text in [
+            "%-s:\\nUsaeg teh",
+            "%*s:\\nUsaeg teh",
+            "%#x:\\nUsaeg teh",
+            "%.*s:\\nUsaeg teh",
+            "%+d:\\nUsaeg teh",
+            "%1$s:\\nUsaeg teh",
+            "%-05.*s:\\nUsaeg teh",
+        ] {
+            check_each(&[(text, [&["teh"], &["Usaeg", "teh"], &["teh"], &["teh"]])]);
+        }
+        check_each(&[
+            ("%#x:\\nVaule", [&[], &["Vaule"], &[], &[]]),
+            // `/` isn't an escape in any kind.
+            ("%-s:/wrod %*d:/wrod", [&["wrod", "wrod"]; 4]),
+            // Markdown emphasis isn't a printf flag.
+            ("*C:/Users/outdirr/Docs* and **C:/Users/outdirr/Docs**", [&["and"]; 4]),
+            ("Save it to *C:/Temp/outdirr* now.", [&["Save", "it", "to", "now"]; 4]),
+            ("_C:/Temp/outdirr_ and -C:/Temp/outdirr", [&["and"]; 4]),
+        ]);
+    }
+
+    #[test]
     fn test_escaped_apostrophes() {
         check(&[
             ("isn\\'t ok", &["ok"]),
@@ -917,16 +1078,36 @@ mod tests {
                 ("$(Get-Date) done", &["Get", "Date", "done"]),
             ],
         );
-        // PowerShell's scope and drive qualified variables.
+        // PowerShell's scope and drive qualified variables. SQL strings read them the same way.
         check_verbatim(&[
             ("Path is $env:windir and $script:cfg here", &["Path", "is", "and", "here"]),
             ("$usr:pass teh", &["teh"]),
-            // An escaped `$` is literal.
-            ("`$price is literal", &["price", "is", "literal"]),
         ]);
+        // An escaped `$` is literal.
+        check_powershell(&[("`$price is literal", &["price", "is", "literal"])]);
         check_code(&[("$usr:pass teh", &["pass", "teh"])]);
         // In prose, `$` is punctuation (or LaTeX math).
         check_prose(&[("Hello $usr and $cfg", &["Hello", "usr", "and", "cfg"])]);
+    }
+
+    #[test]
+    fn test_skip_brace_variables() {
+        // Prose, CodeString, VerbatimString, SqlString. A `${` that doesn't start a placeholder
+        // still starts a variable.
+        check_each(&[
+            ("${env:ProgramFiles(x86)}", [&["env"], &[], &[], &[]]),
+            ("\"${translat(x)} done\"", [&["translat", "done"], &["done"], &["done"], &["done"]]),
+            ("$${teh(x)} x${teh(x)}", [&["teh", "teh"], &[], &[], &[]]),
+            // Only the name right after it.
+            ("${usr(teh)}", [&["usr", "teh"], &["teh"], &["teh"], &["teh"]]),
+            // A placeholder ends the variable.
+            ("\"${name}teh\"", [&["name", "teh"], &["teh"], &["teh"], &["teh"]]),
+            // Without a `$`, it's no variable.
+            ("{teh(x)} done", [&["teh", "done"]; 4]),
+            // Whitespace ends it.
+            ("${a b} teh", [&["teh"]; 4]),
+            ("${a teh}", [&["teh"]; 4]),
+        ]);
     }
 
     #[test]
@@ -1109,51 +1290,60 @@ mod tests {
         // 10k bytes of words.
         let text = "word ".repeat(2000);
         assert_eq!(text.len(), 10_000);
-        assert_eq!(check_contract(text.as_bytes()), [2000; 3]);
+        assert_eq!(check_contract(text.as_bytes()), [2000; 4]);
 
         // A single 10k byte word.
         let text = "a".repeat(10_000);
-        assert_eq!(check_contract(text.as_bytes()), [0; 3]);
+        assert_eq!(check_contract(text.as_bytes()), [0; 4]);
 
-        // Mixed content, repeated. In a verbatim string, `c is an escape, which leaves "ode".
+        // Mixed content, repeated. In a PowerShell string, `code` isn't a code span.
         let text = "Teh `code` <b>tag</b> http://x.y naïve foo_bar don't ".repeat(200);
-        assert_eq!(check_contract(text.as_bytes()), [800, 800, 1000]);
+        assert_eq!(check_contract(text.as_bytes()), [800, 800, 1000, 800]);
 
         // Pathological inputs for the mask searches.
         let text = "<a ".repeat(4000);
-        assert_eq!(check_contract(text.as_bytes()), [0; 3]);
+        assert_eq!(check_contract(text.as_bytes()), [0; 4]);
         let text = "<b word ".repeat(2000);
-        assert_eq!(check_contract(text.as_bytes()), [2000; 3]);
+        assert_eq!(check_contract(text.as_bytes()), [2000; 4]);
         let mut text = String::new();
         for n in 1..=100 {
             text.push_str(&"`".repeat(n));
             text.push_str(" ab ");
         }
         // Runs of 1..=64 backticks are each unmatched and >64 are always unmatched.
-        assert_eq!(check_contract(text.as_bytes()), [100; 3]);
+        assert_eq!(check_contract(text.as_bytes()), [100; 4]);
 
         // Long runs for the masks within a run.
         let text = "\\u{".to_owned() + &"f".repeat(10_000) + "}word";
-        assert_eq!(check_contract(text.as_bytes()), [0, 1, 0]);
+        assert_eq!(check_contract(text.as_bytes()), [0, 1, 0, 0]);
         let text = "%-0+#".repeat(2000) + "word";
-        assert_eq!(check_contract(text.as_bytes()), [1; 3]);
+        assert_eq!(check_contract(text.as_bytes()), [1; 4]);
         let text = "%(ab".repeat(4000);
-        assert_eq!(check_contract(text.as_bytes()), [4000; 3]);
+        assert_eq!(check_contract(text.as_bytes()), [4000; 4]);
         let text = "{ab".repeat(4000);
-        assert_eq!(check_contract(text.as_bytes()), [4000; 3]);
+        assert_eq!(check_contract(text.as_bytes()), [4000; 4]);
         let text = "{".repeat(10_000) + "ab}";
-        assert_eq!(check_contract(text.as_bytes()), [1, 0, 0]);
+        assert_eq!(check_contract(text.as_bytes()), [1, 0, 0, 0]);
         let text = "$ab".repeat(4000);
-        assert_eq!(check_contract(text.as_bytes()), [4000, 0, 0]);
+        assert_eq!(check_contract(text.as_bytes()), [4000, 0, 0, 0]);
+        let text = "${ab(".repeat(3000);
+        assert_eq!(check_contract(text.as_bytes()), [3000, 0, 0, 0]);
+        let text = "${".repeat(5000) + "ab(";
+        assert_eq!(check_contract(text.as_bytes()), [1, 0, 0, 0]);
         let text = "`nab".repeat(4000);
-        assert_eq!(check_contract(text.as_bytes()), [2000, 2000, 4000]);
+        assert_eq!(check_contract(text.as_bytes()), [2000, 2000, 4000, 2000]);
+        let text = "`Gab".repeat(4000);
+        assert_eq!(check_contract(text.as_bytes()), [2000, 2000, 4000, 2000]);
         let text = "&ab".repeat(4000);
-        assert_eq!(check_contract(text.as_bytes()), [4000; 3]);
+        assert_eq!(check_contract(text.as_bytes()), [4000; 4]);
         // ab, then cdab for each repetition, then cd. With the escape it's a single word.
         let text = "ab\\'cd".repeat(2000);
-        assert_eq!(check_contract(text.as_bytes()), [0; 3]);
+        assert_eq!(check_contract(text.as_bytes()), [0; 4]);
         let text = "ab''cd".repeat(2000);
-        assert_eq!(check_contract(text.as_bytes()), [2001, 2001, 0]);
+        assert_eq!(check_contract(text.as_bytes()), [2001, 2001, 0, 0]);
+        // A long printf prefix before a lone letter and a `:`.
+        let text = "%".to_owned() + &"-".repeat(10_000) + "s:\\nab";
+        assert_eq!(check_contract(text.as_bytes()), [0, 1, 0, 0]);
     }
 
     #[test]
@@ -1210,6 +1400,8 @@ mod tests {
             b"`",
             b"``",
             b"`n",
+            b"`G",
+            b"`0",
             b"<",
             b"<a",
             b"</",
@@ -1224,12 +1416,16 @@ mod tests {
             b"(",
             b")",
             b"$",
+            b"${",
             b"x",
             b"s",
             b"AB",
             b"f",
             b"%",
             b"%(",
+            b"%-",
+            b"%1$",
+            b"*",
             b"l",
             b"&",
             b"&#",
@@ -1261,7 +1457,7 @@ mod tests {
         let mut text = Vec::new();
         let mut actual = Vec::new();
         let mut expected = Vec::new();
-        let mut total = [0; 3];
+        let mut total = [0; 4];
 
         for _ in 0..5000 {
             text.clear();
@@ -1295,7 +1491,8 @@ mod tests {
     }
 
     /// A quadratic version of the run splitting in `for_each_word_in`, without its caches.
-    /// The kinds only differ in backticks: a verbatim string has escapes instead of code spans.
+    /// The kinds only differ in backticks: a PowerShell string ([`TextKind::VerbatimString`]) has
+    /// escapes instead of code spans.
     fn reference_runs(text: &[u8], kind: TextKind) -> Vec<Range<usize>> {
         let backticks_at = |i: usize| text[i..].iter().take_while(|&&b| b == b'`').count();
         let escape_len =
