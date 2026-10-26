@@ -14,18 +14,20 @@ that is built into the binary, so there is nothing to install.
 | Markdown (`.md`) | Prose, headings, lists, emphasis, link text. Not: inline code, link URLs, fenced code blocks (```` ``` ```` and `~~~`) and their fence lines, indented code blocks, YAML front matter, HTML tags and single-line HTML comments |
 | Git commit messages (`COMMIT_EDITMSG`, `MERGE_MSG`) | The message. Not: `#` lines, or the diff that `git commit -v` appends |
 | Code (Rust, C, C++, C#, Go, Java, JavaScript, Python, PowerShell, shell, SQL, …) | Comments and string literals |
-| Data formats (JSON, YAML, TOML, XML/HTML, INI/properties/git config, `.gitignore`, `git-rebase-todo`) | Comments only. In `git-rebase-todo`, commit subjects and `exec` lines count as comments, so they're checked |
+| Data formats (JSON, YAML, TOML, XML/HTML, INI/properties/git config, `.gitignore`, `git-rebase-todo`) | Comments only. In `git-rebase-todo`, commit subjects and `exec` lines count as comments and are checked, but git's `#` help text isn't |
 | Diffs (`.diff`, `.patch`) | Nothing |
 
 In Markdown, list items shift the indentation, as in CommonMark. A fence right after a list marker
-(`` 1. ```bash ``) or indented to the item's text is recognized, and it ends with the item. A
-paragraph in an item after a blank line is checked, and indented code in an item needs 4 more
-spaces than the item's text.
+(`` 1. ```bash ``) or indented to the item's text is recognized. It ends at its closing fence or, if
+it's never closed, at the first non-blank line that's indented less than the item's text. Outside a
+list, a fence that's never closed runs to the end of the file. A paragraph in an item after a blank
+line is checked, and indented code in an item needs 4 more spaces than the item's text.
 
 YAML front matter at the top of a Markdown file is skipped: a `---` first line that isn't followed
-by a blank line, through the next `---` or `...` line. If it's never closed, it ends at the first
-line that can't be YAML: one that isn't blank or indented, doesn't start with `#` or `-`, and has
-no `:`.
+by a blank line, through the next `---` or `...` line. It ends early at the first line that can't be
+YAML (one that isn't blank or indented, doesn't start with `#` or `-`, and has no `:`), even if a
+`---` follows later. That line and everything after it are checked as Markdown. Front matter that's
+never closed ends there, too.
 
 Some text is never flagged:
 - URLs, email addresses, file names (`main.rs`), and paths that start with `/`, `./`, `~/` or a
@@ -43,17 +45,22 @@ Inside string literals:
   themselves.
 - printf specs (`%lu`, `%02X`, Python's `%(name)s`) and format placeholders without spaces (`{}`,
   `{0}`, `{name}`, `{0:N2}`) aren't checked.
-- Variables aren't checked: a word right after a `$` (`$user`, `${name}`).
+- Variables aren't checked: a word right after a `$` or `${` (`$user`, `${name}`, PowerShell's
+  `${env:ProgramFiles(x86)}`).
 
 PowerShell and SQL strings don't use `\` escapes, so they're read differently:
 - `\` is read as outside strings, so paths, registry keys and shares
   (`'C:\Program Files\Microsoft Office'`, `'HKLM:\SOFTWARE\Microsoft'`, `'\\server\share'`) aren't
   flagged.
-- PowerShell's backtick escapes (`` `n ``, `` `t ``, `` `$ ``) separate words and aren't checked.
+- PowerShell's backtick escapes, a backtick before ASCII punctuation or one of `0 a b e f n r t u v`
+  (`` `n ``, `` `t ``, `` `$ ``), separate words and aren't checked. Before any other letter,
+  PowerShell keeps the letter as it is, so the backtick is read as punctuation: in
+  ``"Run `Get-Help` for help"``, `Get` and `Help` are checked.
 - A word with a doubled apostrophe (`'isn''t'`) is skipped, like `isn\'t`.
 - T-SQL's Unicode strings (`N'Hello world'`) are read without the `N`.
 - PowerShell's scoped variables (`$env:windir`, `$script:name`) aren't checked.
-- MySQL's backtick-quoted identifiers (`` `Customers` ``) aren't checked.
+- In SQL, a backtick is never an escape. MySQL's backtick-quoted names (`` `Customers` ``) are
+  skipped like code spans, in strings, too (``'Foreign key to `customers`.`id`'``).
 
 Accented spellings of dictionary words are accepted (`café`, `naïve`, `résumé`).
 
@@ -69,7 +76,9 @@ The dictionary loads in the background when `edit` starts, and underlines appear
 Each of these opens a list of up to 8 suggestions for the misspelled word at the cursor, or the
 one that ends right before the cursor. The list opens below the word, or above it if it only fits
 there.
-- **F7** or **Ctrl+T** (these work while the document has focus).
+- **F7** or **Ctrl+T** (these work while the document has focus). On a Mac keyboard, F7 needs
+  **Fn** (Fn+F7) unless its F keys are set to work as standard function keys. The
+  [Cmd+. mapping](#cmd-on-macos-ghostty) below avoids that.
 - **Edit > Spelling Suggestions…**
 - **Right-click** (a two-finger click on a trackpad) on the misspelled word. This moves the cursor
   there and opens the list. Right-clicking a correctly spelled word only moves the cursor.
@@ -82,7 +91,8 @@ In the list:
   Find Next).
 
 Instead of suggestions, the list may show one of these messages: "No suggestions", "No misspelled
-word at cursor", "Loading dictionary…", or "Spell check unavailable".
+word at cursor", "Loading dictionary…", or "Spell check unavailable". A message closes as soon as the
+cursor moves.
 
 In a diff or patch, where nothing is checked, F7, Ctrl+T and Edit > Spelling Suggestions show
 nothing, and a right-click only moves the cursor.
@@ -168,8 +178,8 @@ reading the source; it isn't covered by tests here.)
 
 ## Limitations
 
-- English (en_US) only. There's no personal dictionary or "ignore word", so names and jargon get
-  flagged.
+- English (en_US) only. There's no personal dictionary or "ignore word", so names, jargon and some
+  common tech words (`ok`, `config`, `repo`) get flagged.
 - There's no command to jump to the next or previous misspelling.
 - While the Find bar has focus, F7 and Ctrl+T do nothing. Use Edit > Spelling Suggestions… instead.
 - Right-click does nothing while a dialog is open. With a menu open, a right-click closes the menu
@@ -183,8 +193,10 @@ reading the source; it isn't covered by tests here.)
   `icrosoft`. A path that starts with a drive letter and has no spaces (`"C:\Users\me"`) is
   skipped.
 - In PowerShell and SQL strings, it's the other way around: a MySQL escape (`'Helo\nWorld'`) makes
-  the text around it read as a path, so it isn't checked. PowerShell's single-quoted strings, which
-  have no escapes, still treat a backtick as one.
+  the text around it read as a path, so it isn't checked.
+- PowerShell's single-quoted strings have no escapes, but they're read like double-quoted ones. So
+  a backtick before one of the escape letters still hides that letter: ``'Open `notepad` first'``
+  flags `otepad`.
 - In string literals, a word in braces without spaces (`"{Teh}"`) is taken for a format placeholder
   and isn't checked, and neither is Rust's `{{literal}}`.
 - In `git-rebase-todo`, `exec` lines are checked as prose, so command names and options
@@ -196,7 +208,9 @@ reading the source; it isn't covered by tests here.)
 - Markdown: a fence inside a block quote (`> ```` ``` ````) isn't recognized as a fence, so the
   block's contents may be checked. A line indented by 4 or more spaces right after a heading is
   checked as text. Only the innermost list item's indentation is tracked, so in unusual nesting a
-  line can be taken for code or text when it's the other.
+  line can be taken for code or text when it's the other. A tab right after a list marker
+  (`-<Tab>text`) counts as a single space, so a paragraph in that item that's indented by 6 or 7
+  spaces can be taken for code and isn't checked.
 - Lines longer than 16 KiB and words longer than 48 bytes aren't checked.
 - A misplaced accent is accepted (`cafè`). Suggestions never contain accents.
 - The Find, Replace and Go to Line inputs are never checked.

@@ -4,8 +4,9 @@ This file is fork-only; it isn't part of upstream microsoft/edit. The fork's spe
 feature compiles the following into the `edit` binary, in addition to upstream's own dependencies.
 
 The crate versions below are the ones in `Cargo.lock`. Cargo may pick other versions after
-`cargo update`: `spellbook = "0.4.2"` in `crates/edit/Cargo.toml` allows any 0.4.x, and spellbook
-itself accepts `hashbrown >= 0.15` and `foldhash >= 0.1`. Recheck this file after `cargo update`;
+`cargo update`: `spellbook = "0.4.2"` in `crates/edit/Cargo.toml` allows any 0.4.x, the fork's own
+`foldhash = "0.2"` (for spellbook's fixed hash seed) any 0.2.x, and spellbook itself accepts
+`hashbrown >= 0.15` and `foldhash >= 0.1`. Recheck this file after `cargo update`;
 `cargo tree -p edit -e normal` lists what gets compiled in.
 
 ## spellbook 0.4.2

@@ -1002,6 +1002,24 @@ Prose teh.
 ";
         let mut tb = buffer(Some("markdown"), doc);
         assert_every_window(&mut tb, &[(8, "teh")]);
+
+        // As SPELLCHECK.md describes it: a fence in an item ends at its closing fence, and the
+        // item's text after it is checked. One that's never closed ends at the first non-blank
+        // line that's indented less than the item's text. Outside a list, it runs to the end.
+        let doc = "- Step:\n  ```sh\n  wierd\n  ```\n  More teh.\n- Next wrod.\n";
+        let mut tb = buffer(Some("markdown"), doc);
+        assert_every_window(&mut tb, &[(4, "teh"), (5, "wrod")]);
+        let doc = "- Step:\n  ```sh\n  wierd\n\n  More teh.\nOutside wrod.\n";
+        let mut tb = buffer(Some("markdown"), doc);
+        assert_every_window(&mut tb, &[(5, "wrod")]);
+        let doc = "Intro.\n```sh\nwierd\n\nOutside wrod.\n# Heading teh\n";
+        let mut tb = buffer(Some("markdown"), doc);
+        assert_every_window(&mut tb, &[]);
+        // Known limitation: a tab after the marker counts as one space, so the item's text is at
+        // column 2 instead of 4, and a paragraph indented by 6 is taken for code.
+        let doc = "-\tTab item\n\n      six-space para teh\n\n    four-space para wrod\n";
+        let mut tb = buffer(Some("markdown"), doc);
+        assert_every_window(&mut tb, &[(4, "wrod")]);
     }
 
     #[test]
@@ -1077,6 +1095,11 @@ Body with speling.
         let doc = "---\ntitle: wierd\nSome intro with teh.\n";
         let mut tb = buffer(Some("markdown"), doc);
         assert_every_window(&mut tb, &[(2, "teh")]);
+        // So does front matter that's closed later.
+        let doc =
+            "---\ntitle: x\nwierd line without colon\nauthor: Speling Person\n---\nBody teh.\n";
+        let mut tb = buffer(Some("markdown"), doc);
+        assert_every_window(&mut tb, &[(2, "wierd"), (3, "Speling"), (5, "teh")]);
 
         // Longer than the distance between two checkpoints.
         let mut doc = "---\n".to_string();
@@ -1383,8 +1406,9 @@ SELECT 'Domain\UserNmae teh' AS login;
         assert_eq!(collect(&mut tb), ["teh", "coment", "coment"]);
     }
 
-    /// The rest of [`TextKind::VerbatimString`](tokenizer::TextKind::VerbatimString): PowerShell
-    /// escapes, doubled apostrophes, variables, T-SQL's `N'...'` and printf specs.
+    /// The rest of [`TextKind::VerbatimString`](tokenizer::TextKind::VerbatimString) (PowerShell)
+    /// and [`TextKind::SqlString`](tokenizer::TextKind::SqlString): PowerShell escapes, doubled
+    /// apostrophes, variables, T-SQL's `N'...'` and printf specs.
     #[test]
     fn test_collect_verbatim_strings() {
         let _g = shared_globals();
@@ -1408,7 +1432,7 @@ RAISERROR('Found %ld itmes', 16, 1);
         assert_eq!(collect(&mut tb), ["wierd", "itmes"]);
     }
 
-    /// One line per case, through scope, highlighter and tokenizer.
+    /// One case per line (or a few lines), through scope, highlighter and tokenizer.
     #[test]
     fn test_collect_cross_part() {
         let _g = shared_globals();
@@ -1418,13 +1442,49 @@ RAISERROR('Found %ld itmes', 16, 1);
             ("powershell", r#"Write-Host "Line1`nThe quick fox jumpd""#, &["jumpd"]),
             ("powershell", r#"Write-Host "Done.`nplease restart""#, &[]),
             ("powershell", r#"Write-Host "Running on $env:COMPUTERNAME""#, &[]),
+            (
+                "powershell",
+                r#"Write-Host "Installed in ${env:ProgramFiles(x86)}, teh end""#,
+                &["teh"],
+            ),
+            // A backtick only escapes what PowerShell escapes. Before other letters, it's
+            // punctuation, so `Get` isn't flagged as "et".
+            ("powershell", r#"Write-Host "Run `Get-Help` for help""#, &[]),
+            (
+                "powershell",
+                "$r = @'\n`Get-Report` creates teh report in `C:\\Reports`\n'@",
+                &["teh"],
+            ),
+            (
+                "powershell",
+                "$r = @\"\n`Get-Report` creates teh report in `C:\\Reports`\n\"@",
+                &["teh"],
+            ),
+            // Known limitation: in a single-quoted string, `n isn't an escape, but reads as one.
+            ("powershell", "$m = 'Open `notepad` first'", &["otepad"]),
             ("sql", "SELECT N'Hello world', 'isn''t';", &[]),
             ("sql", "RAISERROR('%ld itmes', 16, 1);", &["itmes"]),
             ("rust", r#"let s = "\nhello teh";"#, &["teh"]),
             ("xml", "<!-- a coment -->", &["coment"]),
-            // MySQL's quoted identifiers are names.
+            // MySQL's quoted identifiers are names, in strings, too: in a SQL string, a backtick
+            // is never an escape, so they're code spans.
             ("sql", "SELECT `Customers`, `Orders` FROM `Sales`;", &[]),
-            // A MySQL escape reads like a path in a verbatim string, so the run is skipped.
+            ("sql", "SELECT `Customers`, `Orders` FROM t", &[]),
+            ("sql", "SELECT `Custmers``Nme`, `my db`.`Ordrs`;", &[]),
+            (
+                "sql",
+                "CREATE TABLE t (id INT COMMENT 'Foreign key to `customers`.`id`, see `invoices`');",
+                &[],
+            ),
+            ("sql", "SET @s = 'ALTER TABLE `orders` ADD COLUMN `status` INT';", &[]),
+            // A line inside a multi-line string is a string from its first column.
+            (
+                "sql",
+                "SET @q = 'SELECT\n`id` AS row_id, `name` AS wrod, `email`\nFROM `users`';",
+                &["wrod"],
+            ),
+            ("sql", "SELECT 'first wrod\n`name` is teh `col`\nend';", &["wrod", "teh"]),
+            // A MySQL escape reads like a path in a SQL string, so the run is skipped.
             ("sql", "SELECT 'Helo\\nWrold';", &[]),
             // Commit subjects and exec lines are comments, read as prose.
             ("git-rebase", "pick 1a2b3c4 Fix teh widget", &["teh"]),

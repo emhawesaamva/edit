@@ -167,20 +167,11 @@ impl Scope {
         // The tokenizer masks `<!` through the next `>` like a tag, which would hide an XML comment
         // that ends on the line it starts on. So its `<!--` is cut off. (Markdown's HTML comments
         // stay masked, so that directives like `<!-- markdownlint-disable -->` aren't flagged.)
-        // In a verbatim string, a backtick is PowerShell's escape character, not a code span. But
-        // in SQL, a string highlight wrapped in backticks is a MySQL quoted identifier: a name,
-        // which would otherwise be flagged in pieces (`` `Customers` `` -> "ustomers").
+        // (MySQL's quoted identifiers are string highlights here. In a SQL string, the tokenizer
+        // reads `` `Customers` `` as a code span and masks it.)
         let mut f = |mut seg: Range<usize>, kind: TextKind| {
             if self == Self::CommentsOnly && line[seg.clone()].starts_with(b"<!--") {
                 seg.start += 4;
-            }
-            let text = &line[seg.clone()];
-            if kind == TextKind::SqlString
-                && text.len() >= 2
-                && text.starts_with(b"`")
-                && text.ends_with(b"`")
-            {
-                return;
             }
             if !seg.is_empty() {
                 f(seg, kind);
@@ -1768,10 +1759,17 @@ multi line coment
             owned(&[(r"N'C:\Data'", SqlString), ("'it''s'", SqlString), ("-- note", Prose)])
         );
         assert_eq!(kinds(sql, "/* note */"), owned(&[("/* note */", Prose)]));
-        // MySQL's quoted identifiers are names, and a backtick isn't an escape in SQL.
+        // MySQL's quoted identifiers are string highlights, too. As SQL strings, the tokenizer
+        // reads their backticks as code spans and masks them.
         assert_eq!(
             kinds(sql, "SELECT `Customers`, \"Orders\" FROM `my db`.`t` -- `note`"),
-            owned(&[("\"Orders\"", SqlString), ("-- `note`", Prose)])
+            owned(&[
+                ("`Customers`", SqlString),
+                ("\"Orders\"", SqlString),
+                ("`my db`", SqlString),
+                ("`t`", SqlString),
+                ("-- `note`", Prose)
+            ])
         );
 
         // Data formats only check comments.
