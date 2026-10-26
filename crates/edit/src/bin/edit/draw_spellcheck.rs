@@ -455,6 +455,37 @@ mod tests {
             self.state.spell.popup.is_some()
         }
 
+        /// Renders the UI like the main loop does and returns the text of every curly underlined run.
+        fn curly_runs(&mut self) -> Vec<String> {
+            let scratch = scratch_arena(None);
+            let output = self.tui.render(&scratch);
+            let mut runs = Vec::new();
+            let mut rest = output.as_str();
+            // `Framebuffer::render` emits `ESC[4:3m ESC[58:2::R:G:Bm`, the text, then `ESC[59m`.
+            while let Some(beg) = rest.find("\x1b[4:3m") {
+                rest = &rest[beg..];
+                let end = rest.find("\x1b[59m").expect("curly underline is closed");
+                let run = &rest[..end];
+                // Drop the escape sequences in front of and inside the run (SGR and CUP).
+                let mut text = String::new();
+                let mut chars = run.chars();
+                while let Some(c) = chars.next() {
+                    if c == '\x1b' {
+                        for c in chars.by_ref() {
+                            if c.is_ascii_alphabetic() {
+                                break;
+                            }
+                        }
+                    } else {
+                        text.push(c);
+                    }
+                }
+                runs.push(text);
+                rest = &rest[end..];
+            }
+            runs
+        }
+
         /// Injects a popup, bypassing `spell_word_at_cursor()`.
         fn open(&mut self, word: Option<SpellWord>, items: &[&str], message: Option<LocId>) {
             self.state.spell.popup = Some(SpellPopup {
@@ -542,13 +573,12 @@ mod tests {
         guard
     }
 
-    /// Whether `spell_open()` would open a popup right now.
-    fn applicable(h: &Harness, quiet: bool) -> bool {
-        match h.buffer().borrow_mut().spell_word_at_cursor() {
-            SpellAt::Disabled => false,
-            SpellAt::Word(_) => true,
-            _ => !quiet,
-        }
+    // The tests below run against the real dictionary, buffer and tui code and assert concrete
+    // results (popup open, suggestions, replaced text), so that a broken hook fails loudly.
+
+    /// The message of the open popup, if any.
+    fn message(h: &Harness) -> Option<LocId> {
+        h.state.spell.popup.as_ref()?.message
     }
 
     #[test]
@@ -614,9 +644,8 @@ mod tests {
         h.key(vk::RETURN);
         assert!(!h.is_open());
 
-        // The selected item replaces the word. The skeleton's `spell_replace()` does nothing.
-        let text = h.contents();
-        assert!(text == "quokka x\n" || text == "teh x\n", "{text:?}");
+        // The selected item replaces the word.
+        assert_eq!(h.contents(), "quokka x\n");
 
         // The focus is back in the textarea.
         let len = h.text_length();
@@ -693,24 +722,20 @@ mod tests {
             let mut h = Harness::new("a teh x\n");
             h.buffer().borrow_mut().cursor_move_to_logical(pt(3, 0));
             h.key(key);
-            assert_eq!(h.is_open(), applicable(&h, false));
+            let items = h.suggestions().expect("popup for the misspelled word");
+            assert!(items.iter().any(|s| s == "the"), "{items:?}");
 
-            // Once `spell_word_at_cursor()` finds words (not in the skeleton):
             // Enter replaces the word with the first suggestion, as a single undo step.
-            if let Some(items) = h.suggestions()
-                && let Some(first) = items.first()
-            {
-                h.key(vk::RETURN);
-                assert!(!h.is_open());
-                assert_eq!(h.contents(), format!("a {first} x\n"));
-                h.key(kbmod::CTRL | vk::Z);
-                assert_eq!(h.contents(), "a teh x\n");
-            }
+            h.key(vk::RETURN);
+            assert!(!h.is_open());
+            assert_eq!(h.contents(), format!("a {} x\n", items[0]));
+            h.key(kbmod::CTRL | vk::Z);
+            assert_eq!(h.contents(), "a teh x\n");
 
-            // On a correct word.
+            // On a correct word: A message instead of suggestions.
             let mut h = Harness::new("a teh x\n");
             h.key(key);
-            assert_eq!(h.is_open(), applicable(&h, false));
+            assert!(message(&h) == Some(LocId::SpellNoMisspelling));
         }
 
         // Edit > Spelling Suggestions sets `request`.
@@ -719,7 +744,7 @@ mod tests {
         h.state.spell.request = true;
         h.frame(None);
         assert!(!h.state.spell.request);
-        assert_eq!(h.is_open(), applicable(&h, false));
+        assert!(h.suggestions().is_some_and(|items| items.iter().any(|s| s == "the")));
     }
 
     #[test]
@@ -751,7 +776,7 @@ mod tests {
         assert!(h.layout_contains("\"Ctrl+T\""));
         h.type_text("s");
         assert!(!h.state.spell.request);
-        assert_eq!(h.is_open(), applicable(&h, false));
+        assert!(h.suggestions().is_some_and(|items| items.iter().any(|s| s == "the")));
     }
 
     #[test]
@@ -772,6 +797,35 @@ mod tests {
         assert!(!h.state.spell.request);
     }
 
+    // Integration: The whole path from typing in a document to the VT output,
+    // i.e. `create_buffer()`, the render hook after the highlights, and the framebuffer's SGR.
+    #[test]
+    fn test_underline_end_to_end() {
+        let _lock = enable_spellcheck();
+        let mut h = Harness::new("");
+        assert!(h.curly_runs().is_empty());
+
+        // A word that's still being typed isn't underlined yet...
+        h.type_text("a teh");
+        assert!(h.curly_runs().is_empty());
+
+        // ...but it is once it's finished.
+        h.type_text(" x");
+        assert_eq!(h.curly_runs(), ["teh"]);
+
+        // Picking "the" from the popup removes the underline.
+        h.buffer().borrow_mut().cursor_move_to_logical(pt(3, 0));
+        h.key(vk::F7);
+        let items = h.suggestions().expect("popup for the misspelled word");
+        let idx = items.iter().position(|s| s == "the").expect("\"the\" is suggested");
+        for _ in 0..idx {
+            h.key(vk::DOWN);
+        }
+        h.key(vk::RETURN);
+        assert_eq!(h.contents().lines().next(), Some("a the x"));
+        assert!(h.curly_runs().is_empty());
+    }
+
     #[test]
     fn test_right_click() {
         let _lock = enable_spellcheck();
@@ -781,22 +835,21 @@ mod tests {
         let margin = h.buffer().borrow().margin_width();
         let click = |x| pt(textarea.left + margin + x, textarea.top);
 
-        // On the misspelled word: opens only if there's a word (quiet mode).
+        // On the misspelled word: Moves the cursor and opens the popup (quiet mode).
         h.mouse(InputMouseState::Right, click(3));
         h.mouse(InputMouseState::None, click(3));
-        assert_eq!(h.is_open(), applicable(&h, true));
-        if h.is_open() {
-            // Below the word, not below the click.
-            let popup = h.outer("spell-suggestions");
-            assert_eq!((popup.left, popup.top), (textarea.left + margin + 2, textarea.top + 1));
-        }
+        assert_eq!(h.buffer().borrow().cursor_logical_pos(), pt(3, 0));
+        assert!(h.suggestions().is_some_and(|items| items.iter().any(|s| s == "the")));
+        // Below the word, not below the click.
+        let popup = h.outer("spell-suggestions");
+        assert_eq!((popup.left, popup.top), (textarea.left + margin + 2, textarea.top + 1));
         h.state.spell.popup = None;
         h.frame(None);
 
-        // On a correct word: never opens.
+        // On a correct word: Only moves the cursor. Quiet mode shows no message.
         h.mouse(InputMouseState::Right, click(0));
         h.mouse(InputMouseState::None, click(0));
+        assert_eq!(h.buffer().borrow().cursor_logical_pos(), pt(0, 0));
         assert!(!h.is_open());
-        assert!(!applicable(&h, true));
     }
 }
