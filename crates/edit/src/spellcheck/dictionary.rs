@@ -16,6 +16,8 @@ use super::Dictionary;
 
 const AFF: &str = include_str!("../../../../assets/dictionaries/en_US/index.aff");
 const DIC: &str = include_str!("../../../../assets/dictionaries/en_US/index.dic");
+/// Common words that `DIC` lacks (`config`, `repo`, ...). See the file's header for the format.
+const ADDON: &str = include_str!("../../../../assets/dictionaries/en_US-addon.dic");
 
 /// How often the main loop should wake up while the dictionary is loading.
 /// A release build loads it in a few ms, but the first frame is drawn even sooner,
@@ -55,7 +57,17 @@ pub fn start_loading() {
 }
 
 fn load() -> Option<Dictionary> {
-    Dictionary::new_with_hasher(AFF, DIC, Default::default()).ok()
+    let mut dict = Dictionary::new_with_hasher(AFF, DIC, Default::default()).ok()?;
+    for line in addon_lines() {
+        // A malformed line only loses that word. (A test makes sure there are none.)
+        _ = dict.add(line);
+    }
+    Some(dict)
+}
+
+/// The entries in `ADDON`, without comments and blank lines.
+fn addon_lines() -> impl Iterator<Item = &'static str> {
+    ADDON.lines().map(str::trim).filter(|line| !line.is_empty() && !line.starts_with('#'))
 }
 
 /// Returns the dictionary if it has finished loading. Never blocks.
@@ -103,6 +115,56 @@ mod tests {
         assert!(!dict.check("teh"));
         assert_eq!(dictionary_status(), DictionaryStatus::Ready);
         assert!(dictionary().is_some());
+    }
+
+    #[test]
+    fn test_addon_dictionary() {
+        let base = Dictionary::new_with_hasher(AFF, DIC, Default::default()).unwrap();
+        let mut dict = Dictionary::new_with_hasher(AFF, DIC, Default::default()).unwrap();
+        let mut stems = std::collections::HashSet::new();
+
+        for line in addon_lines() {
+            assert!(dict.add(line).is_ok(), "malformed: {line:?}");
+            let stem = line.split('/').next().unwrap();
+            assert!(stems.insert(stem), "listed twice: {stem:?}");
+            // Words the bundled dictionary already knows don't belong in the add-on.
+            assert!(!base.check(stem), "already in the bundled dictionary: {stem:?}");
+        }
+
+        let dict = load().unwrap();
+        // Entries, their capitalized and all-caps forms, and their affixes.
+        for word in [
+            "ok",
+            "Ok",
+            "config",
+            "Config",
+            "CONFIG",
+            "configs",
+            "repo's",
+            "todos",
+            "rebased",
+            "rebasing",
+            "symlinked",
+            "subdirectories",
+            "hotfixes",
+            "walkthroughs",
+            "allowlisted",
+            "namespaced",
+            "localhost",
+            "Kubernetes",
+            "Ghostty",
+        ] {
+            assert!(dict.check(word), "{word}");
+        }
+        // Typos are still typos, and the add-on's words get suggested.
+        for (typo, suggestion) in [("confg", "config"), ("rebse", "rebase"), ("symlnk", "symlink")]
+        {
+            assert!(!dict.check(typo), "{typo}");
+            let mut out = Vec::new();
+            dict.suggest(typo, &mut out);
+            assert!(out.iter().any(|s| s == suggestion), "{typo}: {out:?}");
+        }
+        assert!(!dict.check("teh"));
     }
 
     // Regression: spellbook's default hasher gets a random seed for every dictionary, so the order

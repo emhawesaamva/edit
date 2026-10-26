@@ -628,6 +628,16 @@ mod tests {
         assert_eq!(collect_lines(&mut tb, 3..10), [] as [&str; 0]);
     }
 
+    // Words from the add-on dictionary aren't flagged, in prose or in code comments.
+    #[test]
+    fn test_collect_addon_words() {
+        let _g = shared_globals();
+        let mut tb = buffer(None, "Update the config in the repo, then rebase. Ok, teh end.\n");
+        assert_eq!(collect(&mut tb), ["teh"]);
+        let mut tb = buffer(Some("rust"), "// TODO: dedupe the configs on localhost, wrod\n");
+        assert_eq!(collect(&mut tb), ["wrod"]);
+    }
+
     #[test]
     fn test_collect_line_across_gap() {
         let _g = shared_globals();

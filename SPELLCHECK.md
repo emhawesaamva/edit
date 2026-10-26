@@ -65,6 +65,19 @@ PowerShell and SQL strings don't use `\` escapes, so they're read differently:
 
 Accented spellings of dictionary words are accepted (`café`, `naïve`, `résumé`).
 
+## Add-on dictionary
+
+About 320 common words that the en_US dictionary lacks, mostly from software work, are never
+underlined and show up in suggestions: `ok`, `config`, `repo`, `todo`, `backend`, `localhost`,
+`rebase`, `symlink`, `stdout`, `json`, `Kubernetes`, `Ghostty` and so on, with their plurals and
+other forms (`configs`, `repo's`, `rebased`, `symlinking`).
+
+The list is [assets/dictionaries/en_US-addon.dic](assets/dictionaries/en_US-addon.dic), one word per
+line. To add a word, add a line and rebuild `edit`. The file's header explains the format, including
+the flags for plurals and verb forms (`repo/SM`, `rebase/DGS`). A word in lowercase also accepts its
+capitalized and all-caps forms; a capitalized word only those. The tests reject a word that the
+en_US dictionary already knows, a duplicate, or a malformed line.
+
 ## When underlines appear
 
 A word is underlined once you've finished it, after you type a space or punctuation, or move the
@@ -179,8 +192,8 @@ reading the source; it isn't covered by tests here.)
 
 ## Limitations
 
-- English (en_US) only. There's no personal dictionary or "ignore word", so names, jargon and some
-  common tech words (`ok`, `config`, `repo`) get flagged.
+- English (en_US) only. There's no personal dictionary or "ignore word", so names and jargon that
+  aren't in the [add-on dictionary](#add-on-dictionary) get flagged. Adding a word there needs a rebuild.
 - There's no command to jump to the next or previous misspelling.
 - While the Find bar has focus, F7 and Ctrl+T do nothing. Use Edit > Spelling Suggestions… instead.
 - Right-click does nothing while a dialog is open. With a menu open, a right-click closes the menu
@@ -220,4 +233,5 @@ reading the source; it isn't covered by tests here.)
 
 The spellbook engine (MPL-2.0), its dependencies, and the dictionary (SCOWL, MIT and BSD) are listed in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), with the dictionary's own license in
-[assets/dictionaries/en_US/license](assets/dictionaries/en_US/license).
+[assets/dictionaries/en_US/license](assets/dictionaries/en_US/license). The add-on dictionary is part
+of this fork and under its MIT license.
