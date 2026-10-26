@@ -10,17 +10,23 @@
 //!   so callers may use `str::from_utf8_unchecked(&text[range])`.
 //!
 //! The rules, in order:
-//! 1. Masks: code spans (a run of backticks through the next run of equally many),
-//!    HTML/XML tags (`<` plus an ASCII letter, `/` or `!`, through the next `>`) and escapes
-//!    (`\` plus an ASCII letter) are never checked. Unmatched backticks and `<` are punctuation.
-//!    Code spans and tags separate runs like whitespace does. Escapes stay part of their run,
-//!    so that `C:\Users` is still recognized as a path.
+//! 1. Masks: code spans (a run of backticks through the next run of equally many) and
+//!    HTML/XML tags (`<` plus an ASCII letter, `/` or `!`, through the next `>`) are never
+//!    checked. Unmatched backticks and `<` are punctuation. Code spans and tags separate runs
+//!    like whitespace does.
 //! 2. Runs: whole runs between whitespace that look like URLs, email addresses, paths or
-//!    file names are skipped (see `is_skipped_run`).
-//! 3. Words: letters, combining marks, ASCII digits and `_`, plus apostrophes between two letters.
+//!    file names are skipped (see `is_skipped_run`). In [`TextKind::Prose`] that includes every run
+//!    with `\` plus an ASCII letter or digit: paths without a drive, registry keys, LaTeX commands.
+//! 3. Masks within a run: HTML entities (`&nbsp;`, `&#8212;`) are never checked. In a
+//!    [`TextKind::CodeString`], neither are escapes (`\n`, `\x41`, `\u{41}`) and printf specs
+//!    that end at a word boundary (`%lu`), and a word with an escaped apostrophe (`isn\'t`)
+//!    is skipped as a whole. These masks stay part of their run, so that `C:\Users` is still
+//!    recognized as a path.
+//! 4. Words: letters, combining marks, ASCII digits and `_`, plus apostrophes between two letters.
 //!    Leading and trailing `_` are stripped (Markdown's `_italic_`).
-//! 4. Words with digits, an internal `_`, camelCase, ALL CAPS, non-Latin letters, fewer than
-//!    2 characters or more than [`super::MAX_WORD_LEN`] bytes are skipped as a whole.
+//! 5. Words with digits, an internal `_`, camelCase, ALL CAPS (also with a plural `s` or `'s`),
+//!    non-Latin letters, byte or char literals (`b'a'`), fewer than 2 characters or more than
+//!    [`super::MAX_WORD_LEN`] bytes are skipped as a whole.
 //!
 //! Everything runs in linear time without allocating.
 
@@ -30,25 +36,19 @@ use super::MAX_WORD_LEN;
 use crate::simd::memchr2;
 use crate::unicode::Utf8Chars;
 
-/// What kind of text a segment is. It decides how backslashes are read.
+/// What kind of text a segment is. It decides how backslashes and `%` are read.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TextKind {
     /// Prose, comments, Markdown and commit messages: a `\` inside a run is part of a path,
     /// a registry key or a LaTeX command.
     Prose,
-    /// A string literal in code: `\n`, `\x41`, `\u{...}`, `\'` are escape sequences.
+    /// A string literal in code: `\n`, `\x41`, `\u{...}`, `\'` are escape sequences
+    /// and `%lu` is a printf spec.
     CodeString,
 }
 
 /// Calls `f` with the byte range of every candidate word in `text`, reading it as `kind`.
-// SKELETON (round 1 fixes): `kind` is ignored until the tokenizer part implements it.
-pub fn for_each_word_in(text: &[u8], kind: TextKind, f: impl FnMut(Range<usize>)) {
-    _ = kind;
-    for_each_word(text, f)
-}
-
-/// Calls `f` with the byte range of every candidate word in `text`.
-pub fn for_each_word(text: &[u8], mut f: impl FnMut(Range<usize>)) {
+pub fn for_each_word_in(text: &[u8], kind: TextKind, mut f: impl FnMut(Range<usize>)) {
     let len = text.len();
     // Start of the current run.
     let mut run_beg = 0;
@@ -110,15 +110,20 @@ pub fn for_each_word(text: &[u8], mut f: impl FnMut(Range<usize>)) {
 
         if separates {
             if run_beg < beg {
-                for_each_word_in_run(text, run_beg..beg, &mut f);
+                for_each_word_in_run(text, run_beg..beg, kind, &mut f);
             }
             run_beg = i;
         }
     }
 
     if run_beg < len {
-        for_each_word_in_run(text, run_beg..len, &mut f);
+        for_each_word_in_run(text, run_beg..len, kind, &mut f);
     }
+}
+
+/// [`for_each_word_in`] for [`TextKind::Prose`].
+pub fn for_each_word(text: &[u8], f: impl FnMut(Range<usize>)) {
+    for_each_word_in(text, TextKind::Prose, f)
 }
 
 /// Whitespace besides ASCII: NBSP, the U+2000 block spaces (incl. ZWSP), NNBSP and the ideographic space.
@@ -136,7 +141,7 @@ fn is_latin(c: char) -> bool {
 }
 
 /// Finds the run of exactly `n` backticks that closes a code span, searching from `beg`.
-/// Returns the end of that run. `unclosed` remembers failed searches, see [`for_each_word`].
+/// Returns the end of that run. `unclosed` caches failed searches, see [`for_each_word_in`].
 fn find_closing_backticks(
     text: &[u8],
     mut beg: usize,
@@ -174,7 +179,7 @@ fn find_closing_backticks(
 }
 
 /// Whether the run looks like a URL, an email address, a path or a file name.
-fn is_skipped_run(run: &[u8]) -> bool {
+fn is_skipped_run(run: &[u8], kind: TextKind) -> bool {
     // Opening punctuation doesn't hide a path, as in (/usr/bin) or "~/notes".
     let mut trimmed = run;
     loop {
@@ -189,19 +194,27 @@ fn is_skipped_run(run: &[u8]) -> bool {
         return true;
     }
 
+    let prose = kind == TextKind::Prose;
+    let mut prev3 = ' ';
     let mut prev2 = ' ';
     let mut prev = ' ';
     for c in Utf8Chars::new(run, 0) {
         let skip = match c {
             '@' => true,
             '/' => prev2 == ':' && prev == '/',
-            '\\' => prev == ':',
+            // C:\Users. In a code string, Error:\n is an escape, so it takes a lone drive letter.
+            '\\' => {
+                prev == ':' && (prose || (prev2.is_ascii_alphabetic() && !prev3.is_alphanumeric()))
+            }
+            // tools\build, HKEY_CURRENT_USER\Software, \alpha
+            _ if prose && prev == '\\' && c.is_ascii_alphanumeric() => true,
             // main.rs, e.g., example.com, 3.14
             _ => prev == '.' && prev2.is_alphanumeric() && c.is_alphanumeric(),
         };
         if skip {
             return true;
         }
+        prev3 = prev2;
         prev2 = prev;
         prev = c;
     }
@@ -210,16 +223,24 @@ fn is_skipped_run(run: &[u8]) -> bool {
 }
 
 /// Splits a run (text between whitespace) into words and passes the checkable ones to `f`.
-fn for_each_word_in_run(text: &[u8], run: Range<usize>, f: &mut impl FnMut(Range<usize>)) {
-    if is_skipped_run(&text[run.clone()]) {
+fn for_each_word_in_run(
+    text: &[u8],
+    run: Range<usize>,
+    kind: TextKind,
+    f: &mut impl FnMut(Range<usize>),
+) {
+    if is_skipped_run(&text[run.clone()], kind) {
         return;
     }
 
+    let code = kind == TextKind::CodeString;
     let text = &text[..run.end];
     let mut chars = Utf8Chars::new(text, run.start);
     let mut word_beg = None;
     // Whether the previous character, ignoring combining marks, is a letter.
     let mut after_letter = false;
+    // Whether the current word contains an escaped apostrophe.
+    let mut escaped_apostrophe = false;
 
     loop {
         let pos = chars.offset();
@@ -231,17 +252,29 @@ fn for_each_word_in_run(text: &[u8], run: Range<usize>, f: &mut impl FnMut(Range
             true
         } else {
             let joins = match c {
-                '\'' | '\u{2019}' => {
-                    after_letter
-                        && Utf8Chars::new(text, chars.offset())
-                            .next()
-                            .is_some_and(char::is_alphabetic)
+                '\'' | '\u{2019}' => after_letter && is_letter_at(text, chars.offset()),
+                // isn\'t is dropped as a whole: isn alone isn't a word,
+                // and replacing the whole word would drop the escape.
+                '\\' if code
+                    && after_letter
+                    && text.get(pos + 1) == Some(&b'\'')
+                    && is_letter_at(text, pos + 2) =>
+                {
+                    chars.seek(pos + 2);
+                    escaped_apostrophe = true;
+                    true
                 }
+                // In prose, a `\` plus a letter or digit never gets here (see `is_skipped_run`).
                 '\\' => {
-                    // Mask escapes like \n. In \\n the backslash is escaped, not the n.
-                    if text.get(pos + 1).is_some_and(|&b| b.is_ascii_alphabetic() || b == b'\\') {
-                        chars.seek(pos + 2);
-                    }
+                    chars.seek(escape_end(text, pos));
+                    false
+                }
+                '&' => {
+                    chars.seek(entity_end(text, pos));
+                    false
+                }
+                '%' if code => {
+                    chars.seek(printf_spec_end(text, pos));
                     false
                 }
                 _ => c.is_alphabetic() || c.is_ascii_digit() || c == '_',
@@ -253,16 +286,91 @@ fn for_each_word_in_run(text: &[u8], run: Range<usize>, f: &mut impl FnMut(Range
         match (joins, word_beg) {
             (true, None) => word_beg = Some(pos),
             (false, Some(beg)) => {
-                emit_word(text, beg..pos, f);
+                if !escaped_apostrophe {
+                    emit_word(text, beg..pos, f);
+                }
                 word_beg = None;
+                escaped_apostrophe = false;
             }
             _ => {}
         }
     }
 
-    if let Some(beg) = word_beg {
+    if let Some(beg) = word_beg
+        && !escaped_apostrophe
+    {
         emit_word(text, beg..run.end, f);
     }
+}
+
+/// Whether the character at `offset` is a letter.
+fn is_letter_at(text: &[u8], offset: usize) -> bool {
+    Utf8Chars::new(text, offset).next().is_some_and(char::is_alphabetic)
+}
+
+/// Returns how many bytes from `beg` on (at most `max`) match `pred`.
+fn count_at(text: &[u8], beg: usize, max: usize, pred: fn(&u8) -> bool) -> usize {
+    text.get(beg..).unwrap_or_default().iter().take(max).take_while(|b| pred(b)).count()
+}
+
+/// Returns the end of the escape that starts with the `\` at `pos`: `\\`, `\` plus an ASCII letter,
+/// and the hex digits of `\x41`, `\u{41}`, `\u0041` and `\U00000041`.
+fn escape_end(text: &[u8], pos: usize) -> usize {
+    let hex = u8::is_ascii_hexdigit;
+    match text.get(pos + 1) {
+        // In \\n the backslash is escaped, not the n.
+        Some(b'\\') => pos + 2,
+        Some(b'x') => pos + 2 + count_at(text, pos + 2, 2, hex),
+        Some(b'u') if text.get(pos + 2) == Some(&b'{') => {
+            let end = pos + 3 + count_at(text, pos + 3, usize::MAX, hex);
+            if text.get(end) == Some(&b'}') { end + 1 } else { end }
+        }
+        Some(b'u') if count_at(text, pos + 2, 4, hex) == 4 => pos + 6,
+        Some(b'U') if count_at(text, pos + 2, 8, hex) == 8 => pos + 10,
+        Some(b) if b.is_ascii_alphabetic() => pos + 2,
+        _ => pos + 1,
+    }
+}
+
+/// Returns the end of the HTML entity at `pos` (`&nbsp;`, `&#8212;`, `&#x2014;`),
+/// or `pos + 1` if there's none. AT&T and R&D have no `;`, so they stay as they are.
+fn entity_end(text: &[u8], pos: usize) -> usize {
+    let beg = pos + 1;
+    // Where the name or number starts, its length limits and its bytes.
+    let (beg, min, max, pred): (_, _, _, fn(&u8) -> bool) = match text.get(beg..) {
+        Some([b'#', b'x' | b'X', ..]) => (beg + 2, 1, 6, u8::is_ascii_hexdigit),
+        Some([b'#', ..]) => (beg + 1, 1, 7, u8::is_ascii_digit),
+        // A letter, then 1 to 31 letters or digits.
+        Some([b, ..]) if b.is_ascii_alphabetic() => (beg, 2, 32, u8::is_ascii_alphanumeric),
+        _ => return pos + 1,
+    };
+    let len = count_at(text, beg, max + 1, pred);
+    if (min..=max).contains(&len) && text.get(beg + len) == Some(&b';') {
+        beg + len + 1
+    } else {
+        pos + 1
+    }
+}
+
+/// Returns the end of the printf spec at `pos` (`%lu`, `%-8.3lf`), or `pos + 1` if there's none.
+/// The spec must end at a word boundary, so that `%path%` and `LIKE '%name%'` keep their words.
+fn printf_spec_end(text: &[u8], pos: usize) -> usize {
+    let mut i = pos + 1;
+    // Flags, width and precision. The space flag can't occur, because runs end at whitespace.
+    i += count_at(text, i, usize::MAX, |b| matches!(b, b'-' | b'+' | b'#' | b'0'));
+    i += count_at(text, i, usize::MAX, |b| b.is_ascii_digit() || *b == b'*');
+    if text.get(i) == Some(&b'.') {
+        i += 1 + count_at(text, i + 1, usize::MAX, |b| b.is_ascii_digit() || *b == b'*');
+    }
+    // Length modifier.
+    i += match text.get(i..).unwrap_or_default() {
+        [b'h', b'h', ..] | [b'l', b'l', ..] => 2,
+        [b'h' | b'l' | b'j' | b'z' | b't' | b'L' | b'q', ..] => 1,
+        _ => 0,
+    };
+    let conversion = text.get(i).is_some_and(|b| b"diouxXeEfFgGaAcspn".contains(b));
+    let boundary = !text.get(i + 1).is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_');
+    if conversion && boundary { i + 1 } else { pos + 1 }
 }
 
 /// Strips leading and trailing `_` from the word and passes it to `f` if it's worth checking.
@@ -280,10 +388,20 @@ fn emit_word(text: &[u8], range: Range<usize>, f: &mut impl FnMut(Range<usize>))
     }
 }
 
-/// Applies the word skipping rules (rule 4 in the module docs).
+/// Applies the word skipping rules (rule 5 in the module docs).
 /// `word` consists of letters, combining marks, digits, `_` and apostrophes.
 fn is_checkable_word(word: &[u8]) -> bool {
     if word.len() > MAX_WORD_LEN {
+        return false;
+    }
+
+    // Plural and possessive acronyms: APIs, API's.
+    let base = word.strip_suffix(b"s").unwrap_or(word);
+    let base = base
+        .strip_suffix(b"'")
+        .or_else(|| base.strip_suffix("\u{2019}".as_bytes()))
+        .unwrap_or(base);
+    if base.len() >= 2 && base.iter().all(u8::is_ascii_uppercase) {
         return false;
     }
 
@@ -291,6 +409,7 @@ fn is_checkable_word(word: &[u8]) -> bool {
     let mut uppers = 0;
     let mut has_lower = false;
     let mut after_lower = false;
+    let mut apostrophe_second = false;
 
     for c in Utf8Chars::new(word, 0) {
         // Combining marks belong to the previous letter.
@@ -320,34 +439,64 @@ fn is_checkable_word(word: &[u8]) -> bool {
         } else {
             // An apostrophe: d'Artagnan is fine.
             after_lower = false;
+            apostrophe_second |= chars == 2;
         }
     }
 
-    // Acronyms: NASA, OK.
-    chars >= 2 && (has_lower || uppers < 2)
+    // Acronyms: NASA, OK. Byte and char literals: b'a', L'x' (and I'd, which is correct anyway).
+    chars >= 2 && (has_lower || uppers < 2) && !(chars == 3 && apostrophe_second)
 }
 
 #[cfg(test)]
 mod tests {
+    use super::TextKind::{CodeString, Prose};
     use super::*;
+
+    const KINDS: [TextKind; 2] = [Prose, CodeString];
+
+    fn words_in(text: &[u8], kind: TextKind) -> Vec<&str> {
+        let mut words = Vec::new();
+        for_each_word_in(text, kind, |r| words.push(str::from_utf8(&text[r]).unwrap()));
+        words
+    }
 
     fn words(text: &[u8]) -> Vec<&str> {
         let mut words = Vec::new();
         for_each_word(text, |r| words.push(str::from_utf8(&text[r]).unwrap()));
+        assert_eq!(words, words_in(text, Prose), "{text:x?}");
         words
     }
 
+    /// Checks cases that don't depend on the kind.
     fn check(cases: &[(&str, &[&str])]) {
-        for &(text, expected) in cases {
-            assert_eq!(words(text.as_bytes()), expected, "{text:?}");
+        for kind in KINDS {
+            check_in(kind, cases);
         }
     }
 
-    /// Asserts the CONTRACT and returns the number of words.
-    fn check_contract(text: &[u8]) -> usize {
+    fn check_prose(cases: &[(&str, &[&str])]) {
+        check_in(Prose, cases);
+    }
+
+    fn check_code(cases: &[(&str, &[&str])]) {
+        check_in(CodeString, cases);
+    }
+
+    fn check_in(kind: TextKind, cases: &[(&str, &[&str])]) {
+        for &(text, expected) in cases {
+            assert_eq!(words_in(text.as_bytes(), kind), expected, "{kind:?} {text:?}");
+        }
+    }
+
+    /// Asserts the CONTRACT for both kinds and returns the number of words for each.
+    fn check_contract(text: &[u8]) -> [usize; 2] {
+        KINDS.map(|kind| check_contract_in(text, kind))
+    }
+
+    fn check_contract_in(text: &[u8], kind: TextKind) -> usize {
         let mut count = 0;
         let mut prev_end = 0;
-        for_each_word(text, |r| {
+        for_each_word_in(text, kind, |r| {
             assert!(r.start >= prev_end, "{text:x?}: {r:?} overlaps or isn't ascending");
             assert!(r.start < r.end && r.end <= text.len(), "{text:x?}: {r:?}");
             assert!(r.len() <= MAX_WORD_LEN, "{text:x?}: {r:?}");
@@ -429,16 +578,126 @@ mod tests {
 
     #[test]
     fn test_mask_escapes() {
-        check(&[
+        check_code(&[
             ("\\nhello", &["hello"]),
-            ("line one\\nline two", &["line", "one", "line", "two"]),
+            ("\\nhello teh", &["hello", "teh"]),
+            ("line one\\nline two\\tthere", &["line", "one", "line", "two", "there"]),
             ("tab\\there", &["tab", "here"]),
             ("\\\\note", &["note"]),
             ("\\\\\\nfoo", &["foo"]),
             ("word\\", &["word"]),
             ("\\(paren\\)", &["paren"]),
             ("\\u00e9 accent", &["accent"]),
+            // Hex escapes take their digits with them.
+            ("\\xde\\xad\\xbe\\xef \\xca\\xfe", &[]),
+            ("\\u{feff} \\ufeff \\U0000feff \\Udeadbeef \\uFEFF", &[]),
+            ("\\u{10FFFF}abc", &["abc"]),
+            // \x takes at most 2 digits.
+            ("b\"ab\\xFFcd\"", &["ab", "cd"]),
+            ("\\xfacade", &["cade"]),
+            // \u takes exactly 4 and \U exactly 8, otherwise they're masked like \n.
+            ("\\ufad bad", &["fad", "bad"]),
+            ("\\Ubuntu", &["buntu"]),
+            ("\\u{ word", &["word"]),
         ]);
+        check_prose(&[("word\\", &["word"]), ("\\(paren\\)", &["paren"]), ("\\\\ two", &["two"])]);
+    }
+
+    #[test]
+    fn test_backslashes_in_prose() {
+        check_prose(&[
+            // Paths without a drive, registry keys and LaTeX are skipped like C:\ paths.
+            (
+                "Set HKEY_CURRENT_USER\\Software\\Microsoft\\Edit and look in tools\\build\\release.",
+                &["Set", "and", "look", "in"],
+            ),
+            ("Program Files\\Microsoft Office\\root", &["Program"]),
+            ("C:\\Program Files\\Microsoft Office\\root ok", &["ok"]),
+            ("%APPDATA%\\Microsoft\\Windows\\Start Menu", &["Menu"]),
+            ("\\Users\\Public and \\\\server\\share", &["and"]),
+            ("$\\alpha + \\gamma$ and \\textbf{bold}", &["and"]),
+            ("Euler: $e^{i\\pi} + 1 = 0$", &["Euler"]),
+            ("\\frac{a}{b} \\sqrt{x} \\sum_{i=0}^n", &[]),
+            ("splits on \\n and teh tabs", &["splits", "on", "and", "teh", "tabs"]),
+            ("one\\ttwo", &[]),
+            ("backref \\1 here", &["backref", "here"]),
+            ("Error:\\nPlese", &[]),
+            // Markdown escapes of punctuation still work.
+            (
+                "Escaped \\*not emph\\* and \\_under\\_ and \\# and \\<b> and \\`tick\\`",
+                &["Escaped", "not", "emph", "and", "under", "and", "and", "and", "tick"],
+            ),
+        ]);
+        // The same text as a code string: escapes are masked, not the whole run.
+        check_code(&[
+            ("splits on \\n and teh tabs", &["splits", "on", "and", "teh", "tabs"]),
+            ("one\\ttwo", &["one", "two"]),
+        ]);
+    }
+
+    #[test]
+    fn test_drive_paths_in_code_strings() {
+        check_code(&[
+            ("Error:\\nPlese try again", &["Error", "Plese", "try", "again"]),
+            ("key:\\tvalue", &["key", "value"]),
+            ("C:\\Users\\someone here", &["here"]),
+            ("\"C:\\\\Users\\\\someone\" here", &["here"]),
+            ("r\"D:\\temp\" here", &["here"]),
+            ("drive D:\\ here", &["drive", "here"]),
+        ]);
+    }
+
+    #[test]
+    fn test_escaped_apostrophes() {
+        check_code(&[
+            ("isn\\'t ok", &["ok"]),
+            (
+                "'This isn\\'t allowed, you didn\\'t save and it doesn\\'t work.'",
+                &["This", "allowed", "you", "save", "and", "it", "work"],
+            ),
+            ("rock\\'n\\'roll ok", &["ok"]),
+            ("caf\u{00E9}\\'s ok", &["ok"]),
+            // Not between letters.
+            ("\\'quoted\\' word", &["quoted", "word"]),
+            ("it\\' s", &["it"]),
+        ]);
+    }
+
+    #[test]
+    fn test_mask_printf() {
+        check_code(&[
+            ("%lu items, %zu bytes, %lld total, %hhx\\n", &["items", "bytes", "total"]),
+            ("%s and %d and %-10s and %5.2f", &["and", "and", "and"]),
+            ("%lf %jd %td %Lf %qd %ls %#llx %+.3e %*d %.*s %.f", &[]),
+            ("(%lu) [%zu]", &[]),
+            // Only at a word boundary, so these keep their words.
+            ("%path% and %temp%", &["path", "and", "temp"]),
+            ("LIKE '%name%' OR '%apple%'", &["name", "apple"]),
+            ("%luitems %ld_x", &["luitems"]),
+            ("100%% done", &["done"]),
+        ]);
+        // Prose has no printf specs.
+        check_prose(&[
+            ("%lu items", &["lu", "items"]),
+            ("Set %path% and %appdata%", &["Set", "path", "and", "appdata"]),
+        ]);
+    }
+
+    #[test]
+    fn test_mask_entities() {
+        check(&[
+            ("A &nbsp; B &mdash; C &ndash; &hellip; &copy; &lt; &rarr;", &[]),
+            ("dash&mdash;here all&nbsp;rights", &["dash", "here", "all", "rights"]),
+            ("numeric &#8212; &#x2014; &#xabcd; &#XFACE; ok", &["numeric", "ok"]),
+            ("AT&T R&D Q&A", &[]),
+            // Not entities.
+            ("salt&pepper", &["salt", "pepper"]),
+            ("&nbsp and &;", &["nbsp", "and"]),
+            ("&#; &#x; &#12345678; &#x1234567; &#abc;", &["abc"]),
+        ]);
+        let max = format!("&{}; ok", "x".repeat(32));
+        let over = format!("&{};", "x".repeat(33));
+        check(&[(&max, &["ok"]), (&over, &[&over[1..34]])]);
     }
 
     #[test]
@@ -531,10 +790,22 @@ mod tests {
             ("snake_case_name", &[]),
             ("camelCase iPhone McDonald XMLHttpRequest", &[]),
             ("NASA OK DON'T", &[]),
+            // Plural and possessive acronyms.
+            (
+                "All VINs, SSNs, CDLs, DMVs, APIs, PRs and the API's and API\u{2019}s docs.",
+                &["All", "and", "the", "and", "docs"],
+            ),
+            ("Is As Us Ms OSes", &["Is", "As", "Us", "Ms", "OSes"]),
             ("a I x", &[]),
             ("Ab ab AB", &["Ab", "ab"]),
             ("Hello", &["Hello"]),
             ("d'Artagnan O'Neil", &["d'Artagnan", "O'Neil"]),
+            // Byte and char literals: one letter on each side of the apostrophe.
+            ("b'a' b'z' L'x' u8'q'", &[]),
+            (
+                "I'd o'clock y'all d'Artagnan don't I'll",
+                &["o'clock", "y'all", "d'Artagnan", "don't", "I'll"],
+            ),
             ("fooBar-baz", &["baz"]),
             ("Ελληνικά greek", &["greek"]),
             ("日本語 cjk", &["cjk"]),
@@ -583,28 +854,39 @@ mod tests {
         // 10k bytes of words.
         let text = "word ".repeat(2000);
         assert_eq!(text.len(), 10_000);
-        assert_eq!(check_contract(text.as_bytes()), 2000);
+        assert_eq!(check_contract(text.as_bytes()), [2000; 2]);
 
         // A single 10k byte word.
         let text = "a".repeat(10_000);
-        assert_eq!(check_contract(text.as_bytes()), 0);
+        assert_eq!(check_contract(text.as_bytes()), [0; 2]);
 
         // Mixed content, repeated.
         let text = "Teh `code` <b>tag</b> http://x.y naïve foo_bar don't ".repeat(200);
-        assert_eq!(check_contract(text.as_bytes()), 200 * 4);
+        assert_eq!(check_contract(text.as_bytes()), [200 * 4; 2]);
 
         // Pathological inputs for the mask searches.
         let text = "<a ".repeat(4000);
-        assert_eq!(check_contract(text.as_bytes()), 0);
+        assert_eq!(check_contract(text.as_bytes()), [0; 2]);
         let text = "<b word ".repeat(2000);
-        assert_eq!(check_contract(text.as_bytes()), 2000);
+        assert_eq!(check_contract(text.as_bytes()), [2000; 2]);
         let mut text = String::new();
         for n in 1..=100 {
             text.push_str(&"`".repeat(n));
             text.push_str(" ab ");
         }
         // Runs of 1..=64 backticks are each unmatched and >64 are always unmatched.
-        assert_eq!(check_contract(text.as_bytes()), 100);
+        assert_eq!(check_contract(text.as_bytes()), [100; 2]);
+
+        // Long runs for the masks within a run.
+        let text = "\\u{".to_owned() + &"f".repeat(10_000) + "}word";
+        assert_eq!(check_contract(text.as_bytes()), [0, 1]);
+        let text = "%-0+#".repeat(2000) + "word";
+        assert_eq!(check_contract(text.as_bytes()), [1; 2]);
+        let text = "&ab".repeat(4000);
+        assert_eq!(check_contract(text.as_bytes()), [4000; 2]);
+        // ab, then cdab for each repetition, then cd. In a code string it's a single word.
+        let text = "ab\\'cd".repeat(2000);
+        assert_eq!(check_contract(text.as_bytes()), [2001, 0]);
     }
 
     #[test]
@@ -628,6 +910,7 @@ mod tests {
         ];
         for &(text, expected) in cases {
             assert_eq!(words(text), expected, "{text:x?}");
+            assert_eq!(words_in(text, CodeString), expected, "{text:x?}");
             check_contract(text);
         }
     }
@@ -659,6 +942,18 @@ mod tests {
             b">",
             b"/",
             b"\\",
+            b"\\'",
+            b"\\u{",
+            b"}",
+            b"x",
+            b"s",
+            b"AB",
+            b"f",
+            b"%",
+            b"l",
+            b"&",
+            b"&#",
+            b";",
             b":",
             b".",
             b"@",
@@ -685,7 +980,7 @@ mod tests {
         let mut text = Vec::new();
         let mut actual = Vec::new();
         let mut expected = Vec::new();
-        let mut total = 0;
+        let mut total = [0; 2];
 
         for _ in 0..5000 {
             text.clear();
@@ -699,23 +994,28 @@ mod tests {
                 }
             }
 
-            total += check_contract(&text);
+            let counts = check_contract(&text);
 
             // The cached mask searches must not change the result.
-            actual.clear();
-            for_each_word(&text, |r| actual.push(r));
-            expected.clear();
-            for run in reference_runs(&text) {
-                for_each_word_in_run(&text, run, &mut |r| expected.push(r));
+            let runs = reference_runs(&text);
+            for (i, kind) in KINDS.into_iter().enumerate() {
+                actual.clear();
+                for_each_word_in(&text, kind, |r| actual.push(r));
+                expected.clear();
+                for run in &runs {
+                    for_each_word_in_run(&text, run.clone(), kind, &mut |r| expected.push(r));
+                }
+                assert_eq!(actual, expected, "{kind:?} {text:x?}");
+                total[i] += counts[i];
             }
-            assert_eq!(actual, expected, "{text:x?}");
         }
 
         // Make sure the generator isn't so noisy that nothing gets tested.
-        assert!(total > 1000, "{total}");
+        assert!(total.iter().all(|&n| n > 1000), "{total:?}");
     }
 
-    /// A quadratic version of the run splitting in `for_each_word`, without its caches.
+    /// A quadratic version of the run splitting in `for_each_word_in`, without its caches.
+    /// It's the same for both kinds: they only differ within a run.
     fn reference_runs(text: &[u8]) -> Vec<Range<usize>> {
         let backticks_at = |i: usize| text[i..].iter().take_while(|&&b| b == b'`').count();
         let mut runs = Vec::new();
