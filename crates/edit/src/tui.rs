@@ -651,6 +651,15 @@ impl Tui {
                         target = focused_node.map_or(0, |n| n.borrow().id);
                         Self::build_node_path(focused_node, &mut self.focused_node_path);
                         self.needs_more_settling(); // See `needs_more_settling()`.
+                    } else if next_state == InputMouseState::Right
+                        && focused_node.is_some_and(|n| {
+                            matches!(&n.borrow().content, NodeContent::Textarea(tc) if !tc.single_line)
+                        })
+                    {
+                        // Fork: spellcheck. Right-clicks focus multi-line textareas, so that they reach
+                        // the textarea while e.g. a popup has focus. `target` stays 0: Not a left-click.
+                        Self::build_node_path(focused_node, &mut self.focused_node_path);
+                        self.needs_more_settling();
                     }
 
                     // Double-/Triple-/Etc.-clicks are triggered on mouse-down,

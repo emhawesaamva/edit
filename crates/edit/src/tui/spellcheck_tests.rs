@@ -33,6 +33,8 @@ fn click(button: u16, x: CoordType, y: CoordType) -> String {
 enum Widget {
     Textarea(RcTextBuffer),
     Editline(String),
+    /// A textarea with an editline in the row below it, like the editor's Find bar.
+    TextareaAndEditline(RcTextBuffer, String),
 }
 
 /// What the accessors returned during the frames of one [`Harness::feed`] call.
@@ -56,6 +58,20 @@ struct Harness {
 
 impl Harness {
     fn textarea(text: &str, margin: bool) -> Self {
+        Self::new(Widget::Textarea(Self::text_buffer(text, margin)))
+    }
+
+    fn editline(text: &str) -> Self {
+        Self::new(Widget::Editline(text.to_string()))
+    }
+
+    /// The textarea has the focus initially.
+    fn textarea_and_editline(text: &str, line: &str) -> Self {
+        let tb = Self::text_buffer(text, false);
+        Self::new(Widget::TextareaAndEditline(tb, line.to_string()))
+    }
+
+    fn text_buffer(text: &str, margin: bool) -> RcTextBuffer {
         let tb = TextBuffer::new_rc(false).unwrap();
         {
             let mut tb = tb.borrow_mut();
@@ -63,11 +79,7 @@ impl Harness {
             tb.write_raw(text.as_bytes());
             tb.cursor_move_to_logical(Point::default());
         }
-        Self::new(Widget::Textarea(tb))
-    }
-
-    fn editline(text: &str) -> Self {
-        Self::new(Widget::Editline(text.to_string()))
+        tb
     }
 
     fn new(widget: Widget) -> Self {
@@ -84,13 +96,20 @@ impl Harness {
         let mut ctx = tui.create_context(input);
 
         match widget {
-            Widget::Textarea(tb) => ctx.textarea("textarea", tb.clone()),
+            Widget::Textarea(tb) | Widget::TextareaAndEditline(tb, _) => {
+                ctx.textarea("textarea", tb.clone())
+            }
             Widget::Editline(text) => _ = ctx.editline("editline", text),
         }
         ctx.inherit_focus();
         ctx.attr_intrinsic_size(Size { width: 0, height: TEXTAREA_HEIGHT });
         report.right_clicks += ctx.textarea_right_clicked() as usize;
         report.scroll_offsets.push(ctx.textarea_scroll_offset());
+
+        if let Widget::TextareaAndEditline(_, text) = widget {
+            ctx.editline("editline", text);
+            ctx.inherit_focus();
+        }
 
         ctx.block_begin("other");
         ctx.block_end();
@@ -124,6 +143,12 @@ impl Harness {
 
     fn cursor(&self) -> Point {
         self.buffer().borrow().cursor_logical_pos()
+    }
+
+    /// The classname of the focused node in the tree that was rendered last.
+    fn focused(&self) -> &'static str {
+        let id = *self.tui.focused_node_path.last().unwrap();
+        self.tui.prev_node_map.get(id).map_or("", |node| node.borrow().classname)
     }
 
     /// The textarea's scroll offset in the tree that was rendered last.
@@ -286,4 +311,51 @@ fn test_accessors_ignore_other_nodes() {
     assert!(r.scroll_offsets.iter().all(Option::is_some));
     assert_eq!(r.other_right_clicks, 0);
     assert!(r.other_scroll_offsets.iter().all(Option::is_none));
+}
+
+#[test]
+fn test_right_click_focuses_textarea() {
+    let mut h = Harness::textarea_and_editline("hello world\nsecond line\n", "needle");
+    assert_eq!(h.focused(), "textarea");
+
+    // Focus the editline, like clicking into the Find bar.
+    h.feed(&click(LEFT, 2, TEXTAREA_HEIGHT));
+    assert_eq!(h.focused(), "editline");
+
+    // A right-click on the text still reaches the textarea, and moves the focus to it.
+    let r = h.feed(&click(RIGHT, 8, 1));
+    assert_eq!(r.right_clicks, 1);
+    assert_eq!(h.cursor(), Point { x: 8, y: 1 });
+    assert_eq!(h.focused(), "textarea");
+
+    // Editlines ignore right-clicks, so they don't take the focus with one either.
+    let r = h.feed(&click(RIGHT, 2, TEXTAREA_HEIGHT));
+    assert_eq!(r.right_clicks, 0);
+    assert_eq!(h.focused(), "textarea");
+    assert_eq!(h.cursor(), Point { x: 8, y: 1 });
+}
+
+#[test]
+fn test_right_drag_never_selects() {
+    let mut h = Harness::textarea_and_editline("hello world\nsecond line\n", "needle");
+    h.feed(&click(LEFT, 2, TEXTAREA_HEIGHT));
+    assert_eq!(h.focused(), "editline");
+
+    // Only left-button motion is a drag in `Tui::create_context`, so the press that moved
+    // the focus doesn't start a selection either. It's a single right-click.
+    let drag = press(RIGHT, 2, 0)
+        + &press(RIGHT | MOTION, 5, 0)
+        + &press(RIGHT | MOTION, 7, 1)
+        + &release(RIGHT, 7, 1);
+    let r = h.feed(&drag);
+    assert_eq!(r.right_clicks, 1);
+    assert_eq!(h.focused(), "textarea");
+    assert_eq!(h.cursor(), Point { x: 2, y: 0 });
+    assert!(!h.buffer().borrow().has_selection());
+
+    // A left-drag right after it still selects.
+    let drag = press(LEFT, 0, 1) + &press(LEFT | MOTION, 6, 1) + &release(LEFT, 6, 1);
+    let r = h.feed(&drag);
+    assert_eq!(r.right_clicks, 0);
+    assert!(h.buffer().borrow().has_selection());
 }
