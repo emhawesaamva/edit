@@ -16,7 +16,8 @@ pub struct Settings {
     pub file_associations: Vec<(String, &'static Language)>,
     // Fork: spellcheck
     pub spellcheck_enabled: bool,
-    pub spellcheck_curly: bool,
+    /// `None` is "auto": curly unless the terminal is known not to draw it.
+    pub spellcheck_curly: Option<bool>,
 }
 
 struct SettingsCell(SemiRefCell<Settings>);
@@ -38,7 +39,7 @@ impl Settings {
             file_associations: Vec::new(),
             // Fork: spellcheck
             spellcheck_enabled: true,
-            spellcheck_curly: true,
+            spellcheck_curly: None,
         }
     }
 
@@ -109,8 +110,9 @@ impl Settings {
 
         if let Some(value) = root.get("spellcheck.underline") {
             self.spellcheck_curly = match value.as_str() {
-                Some("curly") => true,
-                Some("plain") => false,
+                Some("auto") => None,
+                Some("curly") => Some(true),
+                Some("plain") => Some(false),
                 _ => return Err(apperr::Error::SettingsInvalid("spellcheck.underline")),
             };
         }

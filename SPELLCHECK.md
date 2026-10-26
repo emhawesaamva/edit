@@ -122,14 +122,14 @@ Add these keys to `settings.json`:
 ```json
 {
     "spellcheck.enabled": true,
-    "spellcheck.underline": "curly"
+    "spellcheck.underline": "auto"
 }
 ```
 
 | Key | Values | Default |
 |---|---|---|
 | `spellcheck.enabled` | `true`, `false`. With `false`, the dictionary isn't loaded until you turn on View > Spell Check. | `true` |
-| `spellcheck.underline` | `"curly"` (red curly underline), `"plain"` (normal underline) | `"curly"` |
+| `spellcheck.underline` | `"auto"` (plain in macOS Terminal, curly elsewhere), `"curly"` (red curly underline), `"plain"` (normal underline) | `"auto"` |
 
 Location of `settings.json`:
 - Windows: `%APPDATA%\Microsoft\Edit\settings.json`
@@ -147,8 +147,10 @@ every default.
 
 ### Terminals without curly underlines
 
-The curly underline uses the SGR sequences `4:3` and `58`. Ghostty, for example, supports them.
-If misspelled words show no underline or the wrong one, set `"spellcheck.underline": "plain"`.
+The curly underline uses the SGR sequences `4:3` and `58`. Ghostty, for example, supports them, and
+macOS Terminal doesn't, so with `"auto"` it gets a plain underline (`edit` checks for
+`TERM_PROGRAM=Apple_Terminal`). If misspelled words show no underline or the wrong one in another
+terminal, set `"spellcheck.underline": "plain"`.
 That's likely needed in tmux without the `usstyle` feature, GNU screen, the Linux console, and
 older Windows console hosts (conhost).
 

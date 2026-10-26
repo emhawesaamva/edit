@@ -85,7 +85,9 @@ fn run() -> apperr::Result<()> {
     // It's done after `handle_args`, so that `--help` and `--version` don't pay for it.
     {
         let settings = Settings::borrow();
-        edit::spellcheck::configure(settings.spellcheck_enabled, settings.spellcheck_curly);
+        let curly =
+            settings.spellcheck_curly.unwrap_or_else(edit::spellcheck::terminal_draws_curly);
+        edit::spellcheck::configure(settings.spellcheck_enabled, curly);
     }
 
     handle_stdin(&mut state)?;

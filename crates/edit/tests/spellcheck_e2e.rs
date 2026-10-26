@@ -138,10 +138,11 @@ struct Editor {
 impl Editor {
     /// Starts `edit` with the given arguments in `dir`, and waits until it's past its startup queries.
     fn spawn(dir: &TempDir, args: &[&Path]) -> Self {
-        Self::spawn_with_timeout(dir, args, TEST_TIMEOUT)
+        Self::spawn_with(dir, args, &[], TEST_TIMEOUT)
     }
 
-    fn spawn_with_timeout(dir: &TempDir, args: &[&Path], timeout: Duration) -> Self {
+    /// [`Editor::spawn`] with extra environment variables (and a different timeout).
+    fn spawn_with(dir: &TempDir, args: &[&Path], env: &[(&str, &str)], timeout: Duration) -> Self {
         let deadline = Instant::now() + timeout;
 
         let (child, pty) = {
@@ -158,6 +159,7 @@ impl Editor {
                 .env("TERM", "xterm-256color")
                 .env("LANG", "en_US.UTF-8")
                 .env("LANGUAGE", "en")
+                .envs(env.iter().copied())
                 .stdin(Stdio::from(slave.try_clone().unwrap()))
                 .stdout(Stdio::from(slave.try_clone().unwrap()))
                 .stderr(Stdio::from(slave));
@@ -759,6 +761,27 @@ fn underline_plain() {
     assert!(before.iter().any(|e| e.ends_with("\x1b[4m")), "{before:?}");
 }
 
+// macOS Terminal can't draw the curly underline, so "auto" (the default) uses a plain one there.
+#[test]
+fn underline_auto_in_macos_terminal() {
+    let dir = TempDir::new();
+    let file = dir.write("typo.txt", TYPO_TXT);
+    let env = [("TERM_PROGRAM", "Apple_Terminal")];
+    let editor = Editor::spawn_with(&dir, &[&file], &env, TEST_TIMEOUT);
+
+    editor.wait_screen("a plain underline on \"Teh\"", |s| {
+        s.underline_of("Teh") == Some(Underline::Single)
+    });
+    let out = editor.raw();
+    assert!(!out.contains("4:3m") && !out.contains("58:2"), "{out:?}");
+    drop(editor);
+
+    // An explicit "curly" wins.
+    dir.write_settings(r#"{ "spellcheck.underline": "curly" }"#);
+    let editor = Editor::spawn_with(&dir, &[&file], &env, TEST_TIMEOUT);
+    editor.wait_screen("a curly underline on \"Teh\"", |s| s.is_curly("Teh"));
+}
+
 #[test]
 fn disabled_in_settings() {
     let dir = TempDir::new();
@@ -959,7 +982,7 @@ fn measure_large_file() {
     for (round, enabled) in [false, true, false, true, false, true].into_iter().enumerate() {
         dir.write_settings(&format!(r#"{{ "spellcheck.enabled": {enabled} }}"#));
         let start = Instant::now();
-        let mut editor = Editor::spawn_with_timeout(&dir, &[&file], Duration::from_secs(120));
+        let mut editor = Editor::spawn_with(&dir, &[&file], &[], Duration::from_secs(120));
         editor.wait_screen("the text", |s| s.contains("lorem"));
         let first_frame = start.elapsed();
         if enabled {

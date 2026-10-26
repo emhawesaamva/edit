@@ -67,6 +67,16 @@ pub fn set_enabled(enabled: bool) {
 }
 
 /// The framebuffer attribute used to mark misspelled words.
+/// Whether the terminal is likely to draw curly underlines (`"spellcheck.underline": "auto"`).
+pub fn terminal_draws_curly() -> bool {
+    draws_curly(std::env::var_os("TERM_PROGRAM").as_deref())
+}
+
+fn draws_curly(term_program: Option<&std::ffi::OsStr>) -> bool {
+    // macOS Terminal ignores or misreads `4:3` and `58`, so misspellings had no underline at all.
+    term_program.is_none_or(|p| p != "Apple_Terminal")
+}
+
 pub fn underline_attr() -> Attributes {
     if CURLY.load(Ordering::Relaxed) { Attributes::Undercurl } else { Attributes::Underlined }
 }
@@ -335,6 +345,17 @@ mod tests {
         let stderr = String::from_utf8_lossy(&output.stderr);
         // "1 passed" makes sure that the child found this test.
         assert!(output.status.success() && stdout.contains(" 1 passed"), "{stdout}\n{stderr}");
+    }
+
+    #[test]
+    fn test_draws_curly() {
+        use std::ffi::OsStr;
+
+        assert!(!draws_curly(Some(OsStr::new("Apple_Terminal"))));
+        for term_program in ["ghostty", "iTerm.app", "WezTerm", "vscode", "tmux", ""] {
+            assert!(draws_curly(Some(OsStr::new(term_program))), "{term_program}");
+        }
+        assert!(draws_curly(None));
     }
 
     #[test]
