@@ -11,24 +11,49 @@ that is built into the binary, so there is nothing to install.
 | File | Checked |
 |---|---|
 | No syntax definition (`.txt`, `.log`, `.csv`, `Makefile`, …) | Every word |
-| Markdown (`.md`) | Prose, headings, lists, emphasis, link text. Not: inline code, link URLs, fenced code blocks (```` ``` ```` and `~~~`) and their fence lines, indented code blocks, HTML tags |
+| Markdown (`.md`) | Prose, headings, lists, emphasis, link text. Not: inline code, link URLs, fenced code blocks (```` ``` ```` and `~~~`) and their fence lines, indented code blocks, YAML front matter, HTML tags and single-line HTML comments |
 | Git commit messages (`COMMIT_EDITMSG`, `MERGE_MSG`) | The message. Not: `#` lines, or the diff that `git commit -v` appends |
 | Code (Rust, C, C++, C#, Go, Java, JavaScript, Python, PowerShell, shell, SQL, …) | Comments and string literals |
-| Data formats (JSON, YAML, TOML, XML/HTML, INI/properties/git config, `.gitignore`, `git-rebase-todo`) | Comments only |
+| Data formats (JSON, YAML, TOML, XML/HTML, INI/properties/git config, `.gitignore`, `git-rebase-todo`) | Comments only. In `git-rebase-todo`, commit subjects and `exec` lines count as comments, so they're checked |
 | Diffs (`.diff`, `.patch`) | Nothing |
+
+In Markdown, list items shift the indentation, as in CommonMark. A fence right after a list marker
+(`` 1. ```bash ``) or indented to the item's text is recognized, and it ends with the item. A
+paragraph in an item after a blank line is checked, and indented code in an item needs 4 more
+spaces than the item's text.
+
+YAML front matter at the top of a Markdown file is skipped: a `---` first line that isn't followed
+by a blank line, through the next `---` or `...` line. If it's never closed, it ends at the first
+line that can't be YAML: one that isn't blank or indented, doesn't start with `#` or `-`, and has
+no `:`.
 
 Some text is never flagged:
 - URLs, email addresses, file names (`main.rs`), and paths that start with `/`, `./`, `~/` or a
-  drive letter (`C:\Users`).
+  drive letter (`C:\Users` or `C:/Users`).
 - `` `code` `` spans, `<tags>` and `&entities;`.
 - Words that contain digits or an inner `_`, camelCase words, ALL-CAPS words (also `APIs` and
-  `API's`), and single letters.
+  `API's`), letter plurals (`x's`), and single letters.
+- Words with an escaped apostrophe (`isn\'t`), because a replacement would lose the escape.
 
 Outside string literals, text with a `\` before a letter or digit is skipped too: relative paths
 (`tools\build\release`), registry keys (`HKEY_CURRENT_USER\Software`) and LaTeX commands (`\alpha`).
-Inside string literals, `\` starts an escape instead. Escapes (`\n`, `\x41`, `\u{41}`) and printf
-specs (`%lu`, `%02X`) separate words and aren't checked themselves. A word that contains an escaped
-apostrophe (`isn\'t`) is skipped.
+
+Inside string literals:
+- `\` starts an escape. Escapes (`\n`, `\x41`, `\u{41}`) separate words and aren't checked
+  themselves.
+- printf specs (`%lu`, `%02X`, Python's `%(name)s`) and format placeholders without spaces (`{}`,
+  `{0}`, `{name}`, `{0:N2}`) aren't checked.
+- Variables aren't checked: a word right after a `$` (`$user`, `${name}`).
+
+PowerShell and SQL strings don't use `\` escapes, so they're read differently:
+- `\` is read as outside strings, so paths, registry keys and shares
+  (`'C:\Program Files\Microsoft Office'`, `'HKLM:\SOFTWARE\Microsoft'`, `'\\server\share'`) aren't
+  flagged.
+- PowerShell's backtick escapes (`` `n ``, `` `t ``, `` `$ ``) separate words and aren't checked.
+- A word with a doubled apostrophe (`'isn''t'`) is skipped, like `isn\'t`.
+- T-SQL's Unicode strings (`N'Hello world'`) are read without the `N`.
+- PowerShell's scoped variables (`$env:windir`, `$script:name`) aren't checked.
+- MySQL's backtick-quoted identifiers (`` `Customers` ``) aren't checked.
 
 Accented spellings of dictionary words are accepted (`café`, `naïve`, `résumé`).
 
@@ -41,8 +66,9 @@ The dictionary loads in the background when `edit` starts, and underlines appear
 
 ## Fixing a word
 
-Each of these opens a list of up to 8 suggestions below the misspelled word at the cursor, or the
-one that ends right before the cursor:
+Each of these opens a list of up to 8 suggestions for the misspelled word at the cursor, or the
+one that ends right before the cursor. The list opens below the word, or above it if it only fits
+there.
 - **F7** or **Ctrl+T** (these work while the document has focus).
 - **Edit > Spelling Suggestions…**
 - **Right-click** (a two-finger click on a trackpad) on the misspelled word. This moves the cursor
@@ -52,13 +78,18 @@ In the list:
 - **Up/Down** to choose, **Enter** or a **double-click** to replace. The replacement is one undo
   step, so **Ctrl+Z** brings the old word back.
 - **Esc** or a click elsewhere closes the list. It also closes if you switch documents, resize the
-  terminal, or scroll the word out of view.
+  terminal, scroll the word out of view, or move the cursor off the word (for example with **F3**
+  Find Next).
 
 Instead of suggestions, the list may show one of these messages: "No suggestions", "No misspelled
 word at cursor", "Loading dictionary…", or "Spell check unavailable".
 
+In a diff or patch, where nothing is checked, F7, Ctrl+T and Edit > Spelling Suggestions show
+nothing, and a right-click only moves the cursor.
+
 **View > Spell Check** turns spell checking on or off until you quit. It isn't saved. While it's
-off, the shortcuts do nothing and the Edit menu item is hidden.
+off, the shortcuts do nothing and the Edit menu item is hidden. A right-click still moves the cursor
+and gives the document the focus.
 
 ## Settings
 
@@ -126,6 +157,15 @@ running in Ghostty, not only in `edit`.
 `csi:18~` sends `ESC [ 18 ~`, which is F7. To check the line, put it in a file on its own and run
 `ghostty +validate-config --config-file=<file>`.
 
+## Right-click in Ghostty
+
+Ghostty's `right-click-action` setting (default `context-menu`) doesn't get in the way. According
+to Ghostty 1.3.1's source (`mouseButtonCallback` in `src/Surface.zig`), while a program has mouse
+reporting on, as `edit` does, Ghostty reports the right-button press to the program and doesn't
+run its right-click action, so no context menu appears. Shift+right-click still goes to Ghostty
+and opens its context menu, because `mouse-shift-capture` defaults to `false`. (This comes from
+reading the source; it isn't covered by tests here.)
+
 ## Limitations
 
 - English (en_US) only. There's no personal dictionary or "ignore word", so names and jargon get
@@ -137,16 +177,26 @@ running in Ghostty, not only in `edit`.
 - Code examples in comments, such as Rust doc comments, are checked as prose.
 - JavaScript template literals and Go raw strings (`` `…` ``) aren't checked if they start and end
   on the same line. The lines of a multi-line one are checked.
-- Inside a string literal, `\` is always read as an escape, even where the language doesn't
-  treat it as one (PowerShell `"…"`, SQL, shell `'…'`, C# `@"…"`, Rust `r"…"`). So a Windows path
-  in such a string can be flagged in pieces. For example, `"C:\Program Files\Microsoft Office"`
-  flags `icrosoft`. A path that starts with a drive letter and has no spaces (`"C:\Users\me"`) is
+- Inside a string literal, `\` is read as an escape (except in PowerShell and SQL), even where the
+  language doesn't treat it as one (shell `'…'`, C# `@"…"`, Rust `r"…"`). So a Windows path in such
+  a string can be flagged in pieces. For example, `"C:\Program Files\Microsoft Office"` flags
+  `icrosoft`. A path that starts with a drive letter and has no spaces (`"C:\Users\me"`) is
   skipped.
-- HTML is highlighted as XML, so only its comments are checked. A comment that starts and ends on
-  the same line (`<!-- … -->`) isn't checked at all.
-- Markdown: a fence inside a block quote (`> ```` ``` ````), or indented by 4 or more spaces inside a
-  list item, isn't recognized as a fence, so the block's contents may be checked. A line indented
-  by 4 or more spaces right after a heading is checked as text.
+- In PowerShell and SQL strings, it's the other way around: a MySQL escape (`'Helo\nWorld'`) makes
+  the text around it read as a path, so it isn't checked. PowerShell's single-quoted strings, which
+  have no escapes, still treat a backtick as one.
+- In string literals, a word in braces without spaces (`"{Teh}"`) is taken for a format placeholder
+  and isn't checked, and neither is Rust's `{{literal}}`.
+- In `git-rebase-todo`, `exec` lines are checked as prose, so command names and options
+  (`--relese`) can be flagged.
+- HTML is highlighted as XML, so only its comments are checked. A second comment on the same line
+  right after another one (`<!-- a --><!-- b -->`) isn't checked. In Markdown, a comment that starts
+  and ends on the same line isn't checked at all, so that directives such as
+  `<!-- markdownlint-disable -->` aren't flagged.
+- Markdown: a fence inside a block quote (`> ```` ``` ````) isn't recognized as a fence, so the
+  block's contents may be checked. A line indented by 4 or more spaces right after a heading is
+  checked as text. Only the innermost list item's indentation is tracked, so in unusual nesting a
+  line can be taken for code or text when it's the other.
 - Lines longer than 16 KiB and words longer than 48 bytes aren't checked.
 - A misplaced accent is accepted (`cafè`). Suggestions never contain accents.
 - The Find, Replace and Go to Line inputs are never checked.

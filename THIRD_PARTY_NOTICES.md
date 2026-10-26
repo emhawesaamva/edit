@@ -84,5 +84,6 @@ the following restrictions:
 * Files: `assets/dictionaries/en_US/index.aff` and `index.dic`, bundled into the binary.
 * License: (MIT AND BSD). The full notices, including the copyright lines, are in
   [`assets/dictionaries/en_US/license`](assets/dictionaries/en_US/license).
+* A binary distribution must include `assets/dictionaries/en_US/license` alongside this file.
 * [`assets/dictionaries/en_US/README.md`](assets/dictionaries/en_US/README.md) records where the
   files come from (wooorm/dictionaries at a pinned commit), the SCOWL version and their SHA-256 hashes.
