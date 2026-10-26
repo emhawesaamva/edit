@@ -82,10 +82,41 @@ pub fn is_word_correct(dict: &Dictionary, word: &str) -> bool {
         if cache.len() >= WORD_CACHE_CAPACITY {
             cache.clear();
         }
-        let correct = dict.check(word);
+        // The bundled dictionary has no accented words, only "cafe" and "naive".
+        // Accept "café" and "naïve" too, at the cost of also accepting misplaced accents ("cafè").
+        let correct = dict.check(word) || (!word.is_ascii() && dict.check(&fold_diacritics(word)));
         cache.insert(word.into(), correct);
         correct
     })
+}
+
+/// The base letter of each character in U+00C0..=U+017F (Latin-1 Supplement and Latin Extended-A).
+/// `.` keeps the character: the æ and œ ligatures are expanded by [`fold_diacritics`] instead,
+/// and ð, þ, ß, ı, ĳ, ĸ, ŉ, ŋ and ſ are letters in their own right, not accented ones.
+const FOLD_TABLE: &[u8; 192] = b"\
+    AAAAAA.CEEEEIIII.NOOOOO.OUUUUY..aaaaaa.ceeeeiiii.nooooo.ouuuuy.y\
+    AaAaAaCcCcCcCcDdDdEeEeEeEeEeGgGgGgGgHhHhIiIiIiIiI...JjKk.LlLlLlL\
+    lLlNnNnNn...OoOoOo..RrRrRrSsSsSsSsTtTtTtUuUuUuUuUuUuWwYyYZzZzZz.";
+
+/// Strips the accents from Latin letters ("café" -> "cafe"), both precomposed ones
+/// and combining marks (U+0300-036F), and expands æ and œ ("archæology" -> "archaeology").
+fn fold_diacritics(word: &str) -> String {
+    let mut folded = String::with_capacity(word.len());
+    for c in word.chars() {
+        match c {
+            '\u{300}'..='\u{36f}' => {}
+            // Title case, because all-caps words aren't checked ("Œdipus" -> "Oedipus").
+            'Æ' => folded.push_str("Ae"),
+            'æ' => folded.push_str("ae"),
+            'Œ' => folded.push_str("Oe"),
+            'œ' => folded.push_str("oe"),
+            _ => match (c as usize).checked_sub(0xc0).and_then(|i| FOLD_TABLE.get(i)) {
+                Some(&base) if base != b'.' => folded.push(base as char),
+                _ => folded.push(c),
+            },
+        }
+    }
+    folded
 }
 
 /// Returns up to `MAX_SUGGESTIONS` (8) replacements for `word`. This can be slow, so call it once per request.
@@ -96,6 +127,9 @@ pub fn suggest(dict: &Dictionary, word: &str) -> Vec<String> {
 
     let typographic = word.contains('\u{2019}');
     let word = word.replace('\u{2019}', "'");
+    // The dictionary has no accented words, so the suggestions never have accents anyway.
+    // Without them, spellbook starts closer to the intended word ("naïeve" -> "naive", not "nave").
+    let word = if word.is_ascii() { word } else { fold_diacritics(&word) };
 
     let mut suggestions = Vec::new();
     dict.suggest(&word, &mut suggestions);
@@ -219,6 +253,83 @@ mod tests {
         }
         for word in ["teh", "recieve", "helo"] {
             assert!(!is_word_correct(dict, word), "{word}");
+        }
+    }
+
+    // Regression: the dictionary only has "cafe" and "naive", so every accented word was flagged.
+    #[test]
+    fn test_is_word_correct_accented() {
+        let dict = dictionary_blocking().unwrap();
+        for word in [
+            "café",
+            "cafe\u{301}", // decomposed
+            "naïve",
+            "Naïve",
+            "résumé",
+            "clichés",
+            "façade",
+            "fiancée",
+            "coöperate",
+            "José",
+            "Zoë\u{2019}s",
+            "archæology",
+            "Œdipus",
+            "Łódź",
+            // The price: misplaced accents are accepted, too.
+            "cafè",
+        ] {
+            assert!(is_word_correct(dict, word), "{word}");
+        }
+        // ß and þ aren't accented letters, so these aren't "Strasse" and "the".
+        for word in ["teh", "tèh", "cafée", "Straße", "þe"] {
+            assert!(!is_word_correct(dict, word), "{word}");
+        }
+
+        // The result is cached under the word as written.
+        let cached = |word: &str| WORD_CACHE.with_borrow(|c| c.get(word).copied());
+        assert!(is_word_correct(dict, "entrée"));
+        assert_eq!(cached("entrée"), Some(true));
+        assert!(!is_word_correct(dict, "entréee"));
+        assert_eq!(cached("entréee"), Some(false));
+    }
+
+    #[test]
+    fn test_fold_diacritics() {
+        assert_eq!(fold_diacritics("ÀÁÂÃÄÅÇÈÉÊËÌÍÎÏÑÒÓÔÕÖØÙÚÛÜÝ"), "AAAAAACEEEEIIIINOOOOOOUUUUY");
+        assert_eq!(fold_diacritics("àáâãäåçèéêëìíîïñòóôõöøùúûüýÿ"), "aaaaaaceeeeiiiinoooooouuuuyy");
+        assert_eq!(
+            fold_diacritics("ĀăĆčĎđĘěĞħİĵĶĹłŃňŐŘşŠťŦŨůŴŷŸŹž"),
+            "AaCcDdEeGhIjKLlNnORsStTUuWyYZz"
+        );
+        assert_eq!(fold_diacritics("ÆæŒœ"), "AeaeOeoe");
+        // Combining marks are dropped.
+        assert_eq!(fold_diacritics("e\u{301}a\u{308}\u{300}n\u{36f}"), "ean");
+        // Everything else stays: letters of their own, non-letters, other blocks and scripts, ASCII.
+        for s in ["ÐðÞþßıĲĳĸŉŊŋſ", "×÷¿", "ƀạλ", "Hello, world!", ""] {
+            assert_eq!(fold_diacritics(s), s);
+        }
+    }
+
+    #[test]
+    fn test_suggest_accented() {
+        let dict = dictionary_blocking().unwrap();
+        let first = |word: &str| suggest(dict, word).into_iter().next();
+
+        // Regression: spellbook got the accented word, which is further away from any
+        // dictionary word ("naïeve" -> "nave", "résumme" -> "Summers", "tèh" -> "Th").
+        assert_eq!(first("naïeve").as_deref(), Some("naive"));
+        assert_eq!(first("résumme").as_deref(), Some("resume"));
+        assert_eq!(first("Résumme").as_deref(), Some("Resume"));
+        assert_eq!(first("tèh").as_deref(), Some("the"));
+        assert_eq!(first("cafe\u{301}e").as_deref(), Some("cafe"));
+        assert!(suggest(dict, "caffé").iter().any(|s| s == "cafe"));
+
+        // The apostrophe style is kept, and nothing breaks on letters that aren't folded.
+        let cafes = suggest(dict, "cafée\u{2019}s");
+        assert!(cafes.iter().any(|s| s == "cafe\u{2019}s"), "{cafes:?}");
+        assert!(cafes.iter().all(|s| !s.contains('\'')), "{cafes:?}");
+        for word in ["Straße", "þe", "ÐÐ", "Éa", "é", "\u{301}", "\u{301}\u{301}"] {
+            assert!(suggest(dict, word).len() <= MAX_SUGGESTIONS, "{word}");
         }
     }
 
