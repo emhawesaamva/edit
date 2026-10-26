@@ -154,6 +154,17 @@ impl Scope {
             Self::CodeVerbatim => TextKind::VerbatimString,
             _ => TextKind::Prose,
         };
+        // The tokenizer masks `<!` through the next `>` like a tag, which would hide an XML comment
+        // that ends on the line it starts on. So its `<!--` is cut off. (Markdown's HTML comments
+        // stay masked, so that directives like `<!-- markdownlint-disable -->` aren't flagged.)
+        let mut f = |mut seg: Range<usize>, kind: TextKind| {
+            if self == Self::CommentsOnly && line[seg.clone()].starts_with(b"<!--") {
+                seg.start += 4;
+            }
+            if !seg.is_empty() {
+                f(seg, kind);
+            }
+        };
         // How far we got. Clamping each span's start to it keeps the output ascending,
         // even if the spans aren't (they always are, but this costs nothing).
         let mut pos = 0;
@@ -1167,6 +1178,54 @@ fn main() {
             check_doc(None, prose),
             [strs(&["Plain text."]), strs(&[]), strs(&["  Indented text."])]
         );
+    }
+
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)]
+    fn test_highlighter_xml_comments() {
+        let doc = "\
+<!-- a coment -->
+  <root><!-- teh note --><child/></root>
+<!-- <b>x</b> -->
+<![CDATA[Some teh text]]>
+<!DOCTYPE html>
+<!---->
+<!--
+multi line coment
+-->
+<!-- a --><!-- teh -->
+";
+        assert_eq!(
+            check_doc(Some(language("xml")), doc),
+            [
+                // A comment's `<!--` is cut off, so that the tokenizer doesn't mask it like a tag.
+                strs(&[" a coment -->"]),
+                strs(&[" teh note -->"]),
+                // Tags in it are still masked.
+                strs(&[" <b>x</b> -->"]),
+                // Neither CDATA nor a DOCTYPE is a comment.
+                strs(&[]),
+                strs(&[]),
+                strs(&["-->"]),
+                strs(&[]),
+                strs(&["multi line coment"]),
+                strs(&["-->"]),
+                // Only the first one. The tokenizer masks the second.
+                strs(&[" a --><!-- teh -->"]),
+            ]
+        );
+
+        // Other scopes keep the `<!--`. In Markdown, the tokenizer masks single-line HTML comments,
+        // so that `<!-- markdownlint-disable -->` and the like aren't flagged.
+        let line = "<!-- markdownlint-disable -->";
+        assert_eq!(check_doc(Some(language("markdown")), line), [strs(&[line])]);
+        assert_eq!(check_doc(None, line), [strs(&[line])]);
+        let hl = [span(0, HighlightKind::Comment), span(line.len(), HighlightKind::Other)];
+        for scope in [Scope::Markdown, Scope::Code, Scope::CodeVerbatim] {
+            assert_eq!(segments(scope, line, 0, &hl), [0..line.len()], "{scope:?}");
+        }
+        assert_eq!(segments(Scope::CommentsOnly, line, 0, &hl), [4..line.len()]);
+        assert_eq!(segments(Scope::CommentsOnly, "<!--", 0, &hl[..1]), []);
     }
 
     #[test]

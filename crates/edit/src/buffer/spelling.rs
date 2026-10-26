@@ -951,6 +951,30 @@ fn mispeled_fn(speling: u32) {
         assert_eq!(collect(&mut tb), ["coment", "wierd"]);
     }
 
+    #[test]
+    fn test_collect_xml_comments() {
+        let _g = shared_globals();
+        // A comment that ends on the line it starts on used to be masked like a tag.
+        let doc = "\
+<!-- a coment -->
+<root><!-- teh note --><child attr=\"wrod\"/></root>
+<!-- <div class=\"speling\">old</div> -->
+<![CDATA[Some untill text]]>
+<!DOCTYPE html>
+<!--
+multi line mesage
+-->
+<!-- a --><!-- freind -->
+";
+        let mut tb = buffer(Some("xml"), doc);
+        assert_eq!(collect(&mut tb), ["coment", "teh", "mesage"]);
+
+        // Markdown's single-line HTML comments stay unchecked, so that directives aren't flagged.
+        let doc = "<!-- markdownlint-disable MD033 -->\n<!-- teh note -->\n";
+        let mut tb = buffer(Some("markdown"), doc);
+        assert_eq!(collect(&mut tb), [] as [&str; 0]);
+    }
+
     /// Scope, highlighter and tokenizer together: `for_each_segment()` picks the `TextKind`,
     /// and the tokenizer reads `\`, `%` and `\'` by it. String literals in code are read as code
     /// (escapes and printf specs separate words), and everything else is read as prose
