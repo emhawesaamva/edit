@@ -60,8 +60,8 @@ pub enum TextKind {
     CodeString,
     /// A string literal in a language whose strings don't use `\` escapes (PowerShell):
     /// `\` is part of a path like in prose, but `%ld` is still a printf spec, `''` is an escaped
-    /// apostrophe, `` `n `` is a PowerShell escape and `N'...'` is a T-SQL Unicode string.
-    /// Placeholders and variables are read like in a [`TextKind::CodeString`].
+    /// apostrophe and `` `n `` is a PowerShell escape. Placeholders and variables are read
+    /// like in a [`TextKind::CodeString`]. (`N'...'`, T-SQL's Unicode string, is handled, too.)
     VerbatimString,
     /// A SQL string literal: like a [`TextKind::VerbatimString`], except that a backtick
     /// is never an escape. It opens a code span (a MySQL quoted identifier) like in prose.
@@ -292,6 +292,8 @@ fn for_each_word_in_run(
         };
         // Whether `c` is a `{` after a `$` that doesn't start a placeholder.
         let mut brace_after_dollar = false;
+        // Whether `c` is a backtick before a `$`.
+        let mut escaped_dollar = false;
 
         let joins = if is_combining_mark(c) {
             true
@@ -328,8 +330,10 @@ fn for_each_word_in_run(
                 }
                 // PowerShell's escapes: `n, `t, `$. Before another letter or digit, a backtick
                 // escapes nothing, so `Get-Help` in a message keeps its G.
+                // "`$cfg = $cfg" prints a variable's name, which is still a variable.
                 '`' if backtick_escapes => {
                     let escaped = text.get(pos + 1).is_some_and(|&b| is_powershell_escape(b));
+                    escaped_dollar = text.get(pos + 1) == Some(&b'$');
                     chars.seek(pos + 1 + escaped as usize);
                     false
                 }
@@ -354,7 +358,7 @@ fn for_each_word_in_run(
             joins
         };
 
-        let mut next_after_dollar = code && (c == '$' || brace_after_dollar);
+        let mut next_after_dollar = code && (c == '$' || brace_after_dollar || escaped_dollar);
         match (joins, word_beg) {
             (true, None) => {
                 word_beg = Some(pos);
@@ -803,13 +807,13 @@ mod tests {
                     &["Done", "nplease", "restart"],
                 ],
             ),
-            // Only PowerShell escapes the `$`.
+            // Only PowerShell escapes the `$`, and `$cfg still prints a variable's name.
             (
                 "`$price is literal",
                 [
                     &["price", "is", "literal"],
                     &["is", "literal"],
-                    &["price", "is", "literal"],
+                    &["is", "literal"],
                     &["is", "literal"],
                 ],
             ),
@@ -1083,8 +1087,11 @@ mod tests {
             ("Path is $env:windir and $script:cfg here", &["Path", "is", "and", "here"]),
             ("$usr:pass teh", &["teh"]),
         ]);
-        // An escaped `$` is literal.
-        check_powershell(&[("`$price is literal", &["price", "is", "literal"])]);
+        // An escaped `$` prints a variable's name ("`$cfg = $cfg"), which isn't checked either.
+        check_powershell(&[
+            ("`$price is literal", &["is", "literal"]),
+            ("Set `$env:PATH and teh", &["Set", "and", "teh"]),
+        ]);
         check_code(&[("$usr:pass teh", &["pass", "teh"])]);
         // In prose, `$` is punctuation (or LaTeX math).
         check_prose(&[("Hello $usr and $cfg", &["Hello", "usr", "and", "cfg"])]);

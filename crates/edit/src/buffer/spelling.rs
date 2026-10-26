@@ -1005,13 +1005,17 @@ Prose teh.
 
         // As SPELLCHECK.md describes it: a fence in an item ends at its closing fence, and the
         // item's text after it is checked. One that's never closed ends at the first non-blank
-        // line that's indented less than the item's text. Outside a list, it runs to the end.
+        // line that's indented less than the item's text. Outside a list, it runs to the end,
+        // and so does one after a nested item, where the item's column is a guess.
         let doc = "- Step:\n  ```sh\n  wierd\n  ```\n  More teh.\n- Next wrod.\n";
         let mut tb = buffer(Some("markdown"), doc);
         assert_every_window(&mut tb, &[(4, "teh"), (5, "wrod")]);
         let doc = "- Step:\n  ```sh\n  wierd\n\n  More teh.\nOutside wrod.\n";
         let mut tb = buffer(Some("markdown"), doc);
         assert_every_window(&mut tb, &[(5, "wrod")]);
+        let doc = "- Step:\n  - Sub:\n\n  ```sh\n  wierd\nOutside wrod.\n";
+        let mut tb = buffer(Some("markdown"), doc);
+        assert_every_window(&mut tb, &[]);
         let doc = "Intro.\n```sh\nwierd\n\nOutside wrod.\n# Heading teh\n";
         let mut tb = buffer(Some("markdown"), doc);
         assert_every_window(&mut tb, &[]);

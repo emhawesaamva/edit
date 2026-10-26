@@ -20,7 +20,8 @@ that is built into the binary, so there is nothing to install.
 In Markdown, list items shift the indentation, as in CommonMark. A fence right after a list marker
 (`` 1. ```bash ``) or indented to the item's text is recognized. It ends at its closing fence or, if
 it's never closed, at the first non-blank line that's indented less than the item's text. Outside a
-list, a fence that's never closed runs to the end of the file. A paragraph in an item after a blank
+list, a fence that's never closed runs to the end of the file, and so can one after a nested list
+item (whose text column isn't known exactly) or until the next fence line. A paragraph in an item after a blank
 line is checked, and indented code in an item needs 4 more spaces than the item's text.
 
 YAML front matter at the top of a Markdown file is skipped: a `---` first line that isn't followed
