@@ -1,5 +1,6 @@
 # Fork-only: runs the upstream CI checks (ci.yml) on pushes to feature branches,
 # which ci.yml itself only does for main and pull requests to main.
+# Unlike ci.yml, it also runs on macOS, the fork's main platform, so the pty end-to-end tests run there too.
 name: Fork CI
 
 permissions:
@@ -23,6 +24,7 @@ jobs:
         os:
           - ubuntu-latest
           - windows-latest
+          - macos-latest
     steps:
       # The Windows runners have autocrlf enabled by default.
       - name: Disable git autocrlf
