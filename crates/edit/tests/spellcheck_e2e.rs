@@ -72,15 +72,22 @@ impl TempDir {
         path
     }
 
-    /// Writes the editor's settings.json. See `config_dir()` in settings.rs.
+    /// Writes the editor's settings.json.
     fn write_settings(&self, json: &str) -> PathBuf {
-        let dir = if cfg!(any(target_os = "macos", target_os = "ios")) {
-            "home/Library/Application Support/com.microsoft.edit"
-        } else {
-            "xdg/msedit"
-        };
-        self.write(&format!("{dir}/settings.json"), json)
+        self.write(&format!("{}/settings.json", Self::CONFIG_DIR), json)
     }
+
+    /// Reads a file in the editor's settings directory.
+    fn read_config(&self, name: &str) -> String {
+        fs::read_to_string(self.0.join(Self::CONFIG_DIR).join(name)).unwrap_or_default()
+    }
+
+    /// See `config_dir()` in settings.rs.
+    const CONFIG_DIR: &str = if cfg!(any(target_os = "macos", target_os = "ios")) {
+        "home/Library/Application Support/com.microsoft.edit"
+    } else {
+        "xdg/msedit"
+    };
 }
 
 impl Drop for TempDir {
@@ -815,6 +822,64 @@ fn disabled_in_settings() {
     editor.wait_screen("a checked Spell Check item", |s| {
         s.find("Spell").is_some_and(|(_, y)| s.row_text(y).contains('◼'))
     });
+}
+
+// View > Spell Check is remembered, but an explicit "spellcheck.enabled" in settings.json wins.
+#[test]
+fn spell_check_is_remembered() {
+    let dir = TempDir::new();
+    let (mut editor, file, screen) = open_typo(&dir);
+    editor.left_click(screen.find("View").unwrap());
+    let screen = editor.wait_screen("the View menu", |s| s.contains("Spell Check"));
+    editor.left_click(screen.find("Spell").unwrap());
+    editor.wait_screen("no underline", |s| s.underline_of("Teh") == Some(Underline::None));
+    assert_eq!(dir.read_config("view-state.json"), "{\n    \"spellCheck\": false\n}\n");
+    drop(editor);
+
+    // The next session starts with it off: the menu item is unchecked.
+    let mut editor = Editor::spawn(&dir, &[&file]);
+    let screen = editor.wait_screen("the text", |s| s.contains("Teh quick brown fox"));
+    editor.left_click(screen.find("View").unwrap());
+    let screen = editor.wait_screen("the View menu", |s| s.contains("Spell Check"));
+    let item = screen.find("Spell").unwrap();
+    assert!(!screen.row_text(item.1).contains('◼'), "{}", screen.dump());
+    drop(editor);
+
+    dir.write_settings(r#"{ "spellcheck.enabled": true }"#);
+    let editor = Editor::spawn(&dir, &[&file]);
+    editor.wait_screen("a curly underline on \"Teh\"", |s| s.is_curly("Teh"));
+}
+
+// Word wrap (Alt+Z) is remembered, and documents open with the last choice.
+#[test]
+fn word_wrap_is_remembered() {
+    let dir = TempDir::new();
+    let file = dir.write("long.txt", &format!("{}\nSecond line\n", "lorem ipsum ".repeat(12)));
+    // Whether the long first line takes more than one row.
+    let wrapped = |s: &Screen| Some(s.find("Second")?.1 > s.find("lorem")?.1 + 1);
+
+    let mut editor = Editor::spawn(&dir, &[&file]);
+    let screen = editor.wait_screen("the text", |s| s.contains("Second line"));
+    assert_eq!(wrapped(&screen), Some(false), "{}", screen.dump());
+    editor.send("\x1bz");
+    editor.wait_screen("wrapped text", |s| wrapped(s) == Some(true));
+    assert_eq!(dir.read_config("view-state.json"), "{\n    \"wordWrap\": true\n}\n");
+    drop(editor);
+
+    let mut editor = Editor::spawn(&dir, &[&file]);
+    editor.wait_screen("wrapped text", |s| wrapped(s) == Some(true));
+    editor.send("\x1bz");
+    editor.wait_screen("unwrapped text", |s| wrapped(s) == Some(false));
+    drop(editor);
+
+    // View > Word Wrap is remembered, too.
+    let mut editor = Editor::spawn(&dir, &[&file]);
+    let screen = editor.wait_screen("unwrapped text", |s| wrapped(s) == Some(false));
+    editor.left_click(screen.find("View").unwrap());
+    let screen = editor.wait_screen("the View menu", |s| s.contains("Word Wrap"));
+    editor.left_click(screen.find("Wrap").unwrap());
+    editor.wait_screen("wrapped text", |s| wrapped(s) == Some(true));
+    assert_eq!(dir.read_config("view-state.json"), "{\n    \"wordWrap\": true\n}\n");
 }
 
 #[test]

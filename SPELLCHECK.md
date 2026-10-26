@@ -111,9 +111,20 @@ cursor moves.
 In a diff or patch, where nothing is checked, F7, Ctrl+T and Edit > Spelling Suggestions show
 nothing, and a right-click only moves the cursor.
 
-**View > Spell Check** turns spell checking on or off until you quit. It isn't saved. While it's
-off, the shortcuts do nothing and the Edit menu item is hidden. A right-click still moves the cursor
-and gives the document the focus.
+**View > Spell Check** turns spell checking on or off, and `edit` starts that way next time (see
+[Remembered View choices](#remembered-view-choices)). While it's off, the shortcuts do nothing and
+the Edit menu item is hidden. A right-click still moves the cursor and gives the document the focus.
+
+### Remembered View choices
+
+`edit` remembers the last choice for **View > Word Wrap** (Alt+Z) and **View > Spell Check**:
+- Word wrap: every document you open starts with word wrap on or off, as you last set it.
+  (Alt+Z still switches only the current document.)
+- Spell check: `edit` starts with it on or off, as you last set it. A `"spellcheck.enabled"` in
+  `settings.json` wins over the remembered choice.
+
+They're saved in `view-state.json`, next to `settings.json` (see below), whenever you change one.
+`edit` writes that file itself and never changes `settings.json`. Delete it to forget both choices.
 
 ## Settings
 
@@ -128,7 +139,7 @@ Add these keys to `settings.json`:
 
 | Key | Values | Default |
 |---|---|---|
-| `spellcheck.enabled` | `true`, `false`. With `false`, the dictionary isn't loaded until you turn on View > Spell Check. | `true` |
+| `spellcheck.enabled` | `true`, `false`. With `false`, the dictionary isn't loaded until you turn on View > Spell Check. Without it, the last View > Spell Check choice applies. | `true` |
 | `spellcheck.underline` | `"auto"` (plain in macOS Terminal, curly elsewhere), `"curly"` (red curly underline), `"plain"` (normal underline) | `"auto"` |
 
 Location of `settings.json`:

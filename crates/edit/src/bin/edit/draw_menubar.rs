@@ -144,6 +144,7 @@ fn draw_menu_view(ctx: &mut Context, state: &mut State) {
         }
         if ctx.menubar_menu_checkbox(loc(LocId::ViewWordWrap), 'W', kbmod::ALT | vk::Z, word_wrap) {
             tb.set_word_wrap(!word_wrap);
+            crate::view_state::set_word_wrap(!word_wrap); // Fork: remember View choices
             ctx.needs_rerender();
         }
     }
@@ -152,6 +153,7 @@ fn draw_menu_view(ctx: &mut Context, state: &mut State) {
     let spellcheck = edit::spellcheck::is_enabled();
     if ctx.menubar_menu_checkbox(loc(LocId::ViewSpellCheck), 'C', vk::NULL, spellcheck) {
         edit::spellcheck::set_enabled(!spellcheck);
+        crate::view_state::set_spell_check(!spellcheck);
         ctx.needs_rerender();
     }
 

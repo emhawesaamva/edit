@@ -11,6 +11,7 @@ mod draw_statusbar;
 mod localization;
 mod settings;
 mod state;
+mod view_state; // Fork: remember View choices
 
 use std::path::Path;
 use std::time::Duration;
@@ -76,6 +77,7 @@ fn run() -> apperr::Result<()> {
     if let Err(err) = Settings::reload() {
         state.add_error(err);
     }
+    view_state::load(&Settings::borrow().path); // Fork: remember View choices
 
     if handle_args(&mut state)? {
         return Ok(());
@@ -87,7 +89,9 @@ fn run() -> apperr::Result<()> {
         let settings = Settings::borrow();
         let curly =
             settings.spellcheck_curly.unwrap_or_else(edit::spellcheck::terminal_draws_curly);
-        edit::spellcheck::configure(settings.spellcheck_enabled, curly);
+        // settings.json wins over the View menu's last choice.
+        let enabled = settings.spellcheck_enabled.or_else(view_state::spell_check).unwrap_or(true);
+        edit::spellcheck::configure(enabled, curly);
     }
 
     handle_stdin(&mut state)?;

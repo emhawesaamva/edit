@@ -24,8 +24,13 @@ pub fn draw_editor(ctx: &mut Context, state: &mut State) {
     };
 
     if let Some(doc) = state.documents.active() {
+        let word_wrap = doc.buffer.borrow().is_word_wrap_enabled(); // Fork: remember View choices
         ctx.textarea("textarea", doc.buffer.clone());
         ctx.inherit_focus();
+        // Fork: remember View choices. The textarea handles Alt+Z itself.
+        if doc.buffer.borrow().is_word_wrap_enabled() != word_wrap {
+            crate::view_state::set_word_wrap(!word_wrap);
+        }
     } else {
         ctx.block_begin("empty");
         ctx.block_end();

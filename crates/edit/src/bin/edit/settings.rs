@@ -15,7 +15,8 @@ pub struct Settings {
     pub path: PathBuf,
     pub file_associations: Vec<(String, &'static Language)>,
     // Fork: spellcheck
-    pub spellcheck_enabled: bool,
+    /// `None` if it isn't set, so that the View menu's last choice applies.
+    pub spellcheck_enabled: Option<bool>,
     /// `None` is "auto": curly unless the terminal is known not to draw it.
     pub spellcheck_curly: Option<bool>,
 }
@@ -38,7 +39,7 @@ impl Settings {
             path: PathBuf::new(),
             file_associations: Vec::new(),
             // Fork: spellcheck
-            spellcheck_enabled: true,
+            spellcheck_enabled: None,
             spellcheck_curly: None,
         }
     }
@@ -105,7 +106,7 @@ impl Settings {
             let Some(enabled) = value.as_bool() else {
                 return Err(apperr::Error::SettingsInvalid("spellcheck.enabled"));
             };
-            self.spellcheck_enabled = enabled;
+            self.spellcheck_enabled = Some(enabled);
         }
 
         if let Some(value) = root.get("spellcheck.underline") {

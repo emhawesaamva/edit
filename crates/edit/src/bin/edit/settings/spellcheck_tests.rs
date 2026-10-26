@@ -20,26 +20,26 @@ fn load_spellcheck(text: &str) -> apperr::Result<Settings> {
 fn test_spellcheck_defaults() {
     // The underline is "auto" by default: curly unless the terminal can't draw it.
     let s = Settings::new();
-    assert!(s.spellcheck_enabled);
+    assert_eq!(s.spellcheck_enabled, None);
     assert_eq!(s.spellcheck_curly, None);
 
     let s = load_spellcheck("{}").unwrap();
-    assert!(s.spellcheck_enabled);
+    assert_eq!(s.spellcheck_enabled, None);
     assert_eq!(s.spellcheck_curly, None);
 
     let s = load_spellcheck(r#"{ "files.associations": {}, "spellcheck": false }"#).unwrap();
-    assert!(s.spellcheck_enabled);
+    assert_eq!(s.spellcheck_enabled, None);
     assert_eq!(s.spellcheck_curly, None);
 }
 
 #[test]
 fn test_spellcheck_values() {
     let s = load_spellcheck(r#"{ "spellcheck.enabled": false }"#).unwrap();
-    assert!(!s.spellcheck_enabled);
+    assert_eq!(s.spellcheck_enabled, Some(false));
     assert_eq!(s.spellcheck_curly, None);
 
     let s = load_spellcheck(r#"{ "spellcheck.underline": "plain" }"#).unwrap();
-    assert!(s.spellcheck_enabled);
+    assert_eq!(s.spellcheck_enabled, None);
     assert_eq!(s.spellcheck_curly, Some(false));
 
     let s = load_spellcheck(r#"{ "spellcheck.underline": "auto" }"#).unwrap();
@@ -53,7 +53,7 @@ fn test_spellcheck_values() {
         }"#,
     )
     .unwrap();
-    assert!(s.spellcheck_enabled);
+    assert_eq!(s.spellcheck_enabled, Some(true));
     assert_eq!(s.spellcheck_curly, Some(true));
 }
 
