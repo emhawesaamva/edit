@@ -709,6 +709,7 @@ impl TextBuffer {
         self.mark_as_clean();
         self.reflow();
         self.highlighter_cache.invalidate_from(0);
+        self.spell.invalidate_from(0); // Fork: spellcheck
     }
 
     /// Copies the contents of the buffer into a string.
@@ -3031,6 +3032,7 @@ impl TextBuffer {
             };
             debug_assert!(!entry.deleted.is_empty() || !entry.added.is_empty());
             self.highlighter_cache.invalidate_from(entry.logical_y);
+            self.spell.invalidate_from(entry.logical_y); // Fork: spellcheck
         }
 
         self.edit_layout_finish();
@@ -3284,6 +3286,7 @@ impl TextBuffer {
         }
 
         self.highlighter_cache.invalidate_from(damage_start);
+        self.spell.invalidate_from(damage_start); // Fork: spellcheck
         self.recalc_after_content_changed();
     }
 
