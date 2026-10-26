@@ -161,11 +161,18 @@ fn draw_spell_popup(ctx: &mut Context, state: &mut State, textarea: Size, scroll
             width: popup.labels().map(label_width).max().unwrap_or(0) + 4,
             height: popup.labels().count() as CoordType + 2,
         };
+        // The popup closes once the cursor leaves the word (e.g. F3 moved it to the next match),
+        // so that typing and Enter don't go to a word elsewhere, maybe out of view.
+        // F7 and right-clicks open it with the cursor in or right after the word.
+        let offset = tb.cursor_offset();
+        let on_word =
+            popup.word.as_ref().is_none_or(|w| w.range.start <= offset && offset <= w.range.end);
         // Once the word was scrolled out of view (e.g. with the mouse wheel), the popup closes
-        // instead of covering the menubar or statusbar. The cursor is in or right after the word.
+        // instead of covering the menubar or statusbar. The cursor's row counts, too, because
+        // the cursor is in or right after the word (see above), which may be wrapped.
         // Not during the first draw, whose `scroll` predates `make_cursor_visible()` in `spell_open`.
         let visible = |pos| is_visible(textarea, margin_width, pos, scroll);
-        if steal_focus || visible(word_pos) || visible(cursor) {
+        if on_word && (steal_focus || visible(word_pos) || visible(cursor)) {
             Some(popup_position(textarea, margin_width, word_pos, scroll, size))
         } else {
             None
@@ -1216,6 +1223,41 @@ mod tests {
 
         h.wheel(wheel_at, 1);
         assert!(!h.is_open());
+    }
+
+    // Regression: F3 (Find Next) moved the cursor to the next match, but the popup stayed open
+    // for the word it left. With the match far below, the popup was clipped to nothing, but still
+    // had the focus: Typing was swallowed, and Enter replaced the word out of view.
+    #[test]
+    fn test_popup_closes_when_cursor_leaves_word() {
+        let _lock = enable_spellcheck();
+
+        // The match is out of view.
+        let mut h = Harness::new(&format!("{}needle\n", "teh x\n".repeat(100)));
+        h.buffer().borrow_mut().cursor_move_to_logical(pt(1, 10));
+        h.key(vk::F7);
+        assert_eq!(h.popup_word().as_deref(), Some("teh"));
+        h.state.search_needle = "needle".to_string();
+        h.key(vk::F3);
+        assert_eq!(h.cursor(), pt(6, 100));
+        assert!(!h.is_open());
+        // The textarea has the focus: Typing replaces the selected match.
+        h.type_text("z");
+        assert_eq!(h.contents().lines().nth(100), Some("z"));
+        assert_eq!(h.contents().lines().nth(10), Some("teh x"));
+
+        // The match is in view, two rows below the word.
+        let mut h = Harness::new("a teh x\nb\nc needle d\n");
+        h.buffer().borrow_mut().cursor_move_to_logical(pt(3, 0));
+        h.key(vk::F7);
+        assert_eq!(h.popup_word().as_deref(), Some("teh"));
+        h.state.search_needle = "needle".to_string();
+        h.key(vk::F3);
+        assert_eq!(h.cursor(), pt(8, 2));
+        assert!(!h.is_open());
+        // Enter replaces the selected match with a newline, and leaves the misspelled word alone.
+        h.key(vk::RETURN);
+        assert_eq!(h.contents(), "a teh x\nb\nc \n d\n");
     }
 
     #[test]
