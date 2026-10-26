@@ -156,6 +156,17 @@ pub fn suggest(dict: &Dictionary, word: &str) -> Vec<String> {
         }
     }
 
+    // A contraction without its apostrophe ("dont", "Ive") is the likeliest mistake if adding one
+    // gives a word, but spellbook ranks it behind other single edits ("dot", "don", "don't"),
+    // and the reordering above pushes "I've" and "I'm" further down, because "ive" and "im"
+    // have no contraction among their suggestions. So it goes first, before the cut-off.
+    // The popup only looks up misspelled words, so this never applies to words that are
+    // correct without the apostrophe ("cant", "Ill").
+    // The apostrophe style is restored below.
+    if let Some(i) = suggestions.iter().position(|s| is_apostrophe_added(&word, s)) {
+        suggestions[..=i].rotate_right(1);
+    }
+
     suggestions.truncate(MAX_SUGGESTIONS);
 
     // Keep the user's apostrophe style.
@@ -184,6 +195,29 @@ fn suggest_lowercase(dict: &Dictionary, word: &str, native: &[String]) -> Vec<St
     let mut lower: Vec<String> = edits.iter().map(|s| capitalize(s)).collect();
     lower.extend(native.iter().filter(|s| !s.contains([' ', '-'])).cloned());
     lower
+}
+
+/// Whether `suggestion` is `word` with one apostrophe inserted ("dont" -> "don't").
+///
+/// A possessive "'s" doesn't count, because the plural is usually meant ("heros" -> "heroes",
+/// not "hero's"), or a doubled "s" ("Pariss" -> "Paris"). Except after the words whose "'s"
+/// is short for "is" ("thats" -> "that's").
+fn is_apostrophe_added(word: &str, suggestion: &str) -> bool {
+    const IS_CONTRACTIONS: [&[u8]; 9] =
+        [b"he", b"here", b"how", b"she", b"that", b"there", b"what", b"where", b"who"];
+
+    let (word, suggestion) = (word.as_bytes(), suggestion.as_bytes());
+    let prefix = word.iter().zip(suggestion).take_while(|(a, b)| a == b).count();
+    let possessive = match suggestion {
+        [base @ .., b'\'', b's' | b'S'] => {
+            !IS_CONTRACTIONS.iter().any(|c| base.eq_ignore_ascii_case(c))
+        }
+        _ => false,
+    };
+    suggestion.len() == word.len() + 1
+        && suggestion.get(prefix) == Some(&b'\'')
+        && suggestion.get(prefix + 1..) == word.get(prefix..)
+        && !possessive
 }
 
 /// Whether the word starts with an uppercase letter and has no other uppercase letters ("Teh").
@@ -455,11 +489,97 @@ mod tests {
             assert!(ours.iter().all(|s| native.contains(s)), "{word}: {ours:?} vs {native:?}");
         }
 
-        // Lowercase words keep spellbook's order.
+        // Lowercase words keep spellbook's order (unless an apostrophe is missing, see below).
         for word in ["teh", "thier", "agian", "amercia"] {
             dict.suggest(word, &mut native);
             native.truncate(MAX_SUGGESTIONS);
             assert_eq!(suggest(dict, word), native, "{word}");
+        }
+    }
+
+    // Regression: The capitalized "Ive" offered "Vie", "Ives" and "Iv" before "I've", and "Thats"
+    // offered "That's" last. spellbook itself ranks "don't" third for "dont".
+    #[test]
+    fn test_suggest_missing_apostrophe() {
+        let dict = dictionary_blocking().unwrap();
+        let first = |word: &str| suggest(dict, word).into_iter().next();
+        for (word, want) in [
+            ("Ive", "I've"),
+            ("Im", "I'm"),
+            ("Dont", "Don't"),
+            ("dont", "don't"),
+            ("doesnt", "doesn't"),
+            ("Thats", "That's"),
+            ("theres", "there's"),
+            ("theyre", "they're"),
+            ("oclock", "o'clock"),
+        ] {
+            assert_eq!(first(word).as_deref(), Some(want), "{word}");
+        }
+        // Not a possessive, though (Wikipedia's list of misspellings has "heroes" and "aircraft").
+        for (word, possessive) in [
+            ("heros", "hero's"),
+            ("Aircrafts", "Aircraft's"),
+            ("hertzs", "hertz's"),
+            ("Pariss", "Paris's"),
+        ] {
+            let suggestions = suggest(dict, word);
+            assert!(suggestions.iter().skip(1).any(|s| s == possessive), "{suggestions:?}");
+        }
+
+        // It merely moves up: The rest keeps its order.
+        let mut native = Vec::new();
+        dict.suggest("dont", &mut native);
+        native.truncate(MAX_SUGGESTIONS);
+        let mut ours = suggest(dict, "dont");
+        let i = native.iter().position(|s| s == "don't").unwrap();
+        assert!(i > 0, "{native:?}");
+        ours[..=i].rotate_left(1);
+        assert_eq!(ours, native);
+
+        // A misplaced apostrophe isn't a missing one. Its style is kept.
+        let typographic = suggest(dict, "does\u{2019}nt");
+        assert!(typographic.iter().any(|s| s == "doesn\u{2019}t"), "{typographic:?}");
+        assert!(typographic.iter().all(|s| !s.contains('\'')), "{typographic:?}");
+    }
+
+    #[test]
+    fn test_is_apostrophe_added() {
+        for (word, suggestion) in [
+            ("dont", "don't"),
+            ("Ive", "I've"),
+            ("oclock", "o'clock"),
+            ("tis", "'tis"),
+            ("dogs", "dogs'"),
+            ("thats", "that's"),
+            ("Thats", "That's"),
+            ("WHOS", "WHO'S"),
+            ("", "'"),
+        ] {
+            assert!(is_apostrophe_added(word, suggestion), "{word} {suggestion}");
+        }
+        for (word, suggestion) in [
+            // Possessives.
+            ("heros", "hero's"),
+            ("todays", "today's"),
+            ("Pariss", "Paris's"),
+            ("CLASSS", "CLASS'S"),
+            ("o'clocks", "o'clock's"),
+            ("cafés", "café's"),
+            ("s", "'s"),
+            ("thatts", "thatt's"),
+            ("dont", "dont"),
+            ("dont", "done"),
+            ("dont", "don''t"),
+            ("dont", "don\u{2019}t"),
+            ("doesnt", "doesn"),
+            ("does'nt", "doesn't"),
+            ("ive", "I've"),
+            ("dont", "do n't"),
+            ("é", "e'"),
+            ("", ""),
+        ] {
+            assert!(!is_apostrophe_added(word, suggestion), "{word} {suggestion}");
         }
     }
 
